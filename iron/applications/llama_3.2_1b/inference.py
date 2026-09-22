@@ -17,6 +17,15 @@ from src.model_with_json import Llama3ModelWithJSONConfig
 
 # from src.model import Llama3Model
 from src.tokenizer import Tokenizer, ChatFormat
+from src.tokenizer_hf import HFTokenizer
+
+
+def load_tokenizer(tokenizer_file_path):
+    """Return the app-style tokenizer for either sentencepiece (.model,
+    Llama-3 BPE-tiktoken variant) or HF tokenizer.json (GPT-2 BPE, MiniCPM5)."""
+    if str(tokenizer_file_path).endswith(".json"):
+        return HFTokenizer(tokenizer_file_path)
+    return Tokenizer(tokenizer_file_path)
 from safetensors.torch import load_file
 import os
 import shutil
@@ -212,7 +221,7 @@ def inference(
     input_data_path = "results/inputs"
     output_data_path = "results/outputs"
 
-    tokenizer = Tokenizer(tokenizer_file_path)
+    tokenizer = load_tokenizer(tokenizer_file_path)
 
     print(_iron_chat)
     if chat:
@@ -224,7 +233,10 @@ def inference(
     truncated_prompt = token_ids_to_text(token_ids, tokenizer)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, "configs", "llama32_1b.json")
+    config_path = os.path.join(
+        script_dir, "configs", os.environ.get("LLAMA_APP_CONFIG", "llama32_1b.json")
+    )
+    logging.info("Model config: %s", config_path)
     model = Llama3ModelWithJSONConfig(
         config_path=config_path,
         prompt_length=prompt_len,

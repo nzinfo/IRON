@@ -231,7 +231,13 @@ class FeedForward(nn.Module):
             return self.fc3(x).view(original_shape)
 
     def assign_weights(self, l, fc1, fc2, fc3):
-        if self.cfg["use_kv_cache"] and self.cfg["use_aie_ffn_gemv"]:
+        # Match the __init__ guard: separate decode GEMVs are not created when
+        # fused SwiGLU decode handles them (upstream branch misses this check).
+        if (
+            self.cfg["use_kv_cache"]
+            and self.cfg["use_aie_ffn_gemv"]
+            and not self.cfg.get("use_aie_ffn_swiglu_fused", False)
+        ):
             self.aie_fc1_gemv.weight = fc1
             self.aie_fc2_gemv.weight = fc2
             self.aie_fc3_gemv.weight = fc3
