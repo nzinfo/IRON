@@ -24,6 +24,8 @@ def generate_test_params(extensive=False):
             (4096, 64, 8, 8, 4),
             (4096, 64, 8, 8, 2),
             (4096, 64, 8, 8, 0),
+            # d=128 (MiniCPM5 head_dim): PV matmul + layout generalization
+            (2048, 128, 16, 8, 0),
         ]
 
     for seq_len, head_dim, heads, number_of_pipeline, num_kv_heads in params:

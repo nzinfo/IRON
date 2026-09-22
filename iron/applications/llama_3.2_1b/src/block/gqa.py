@@ -339,7 +339,7 @@ class GroupedQueryAttention(nn.Module):
                 self.cfg["use_aie_fused_mha"]
                 and b == 1
                 and num_tokens == self.prompt_length
-                and self.head_dim == 64
+                and self.head_dim in (64, 128)
             ):
                 # TODO: Doesn't give good output ven with num_kv_groups set to 8 with kv_cache
                 # TODO: Doesn't match the output of CPU only when used without kv_cache

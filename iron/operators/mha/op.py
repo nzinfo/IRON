@@ -20,6 +20,17 @@ from iron.common import (
 from iron.common.utils import torch_to_numpy, numpy_to_torch
 
 
+def _unswizzle_c_tiles(x: np.ndarray, d: int) -> np.ndarray:
+    # With the O-join delivered linearly (o_dims=None, see design.py), the
+    # output stream arrives in the kernel's PV C-tile order: per 64-row block,
+    # flat = 1024*z + 64*j + 8*k + e (z = row group, j = col group [d/8 of
+    # them], k = row in group, e = col in group). Transpose (j, k) -> (k, j)
+    # to recover DRAM row-major (verified against NPU one-hot probes).
+    H, S, _ = x.shape
+    y = x.reshape(H, S // 64, 8, d // 8, 8, 8).transpose(0, 1, 2, 4, 3, 5)
+    return np.ascontiguousarray(y).reshape(H, S, d)
+
+
 class AIEMHA(AIEOperatorBase):
 
     def __init__(
@@ -38,7 +49,7 @@ class AIEMHA(AIEOperatorBase):
         self.B_kv = 64
         self.num_KV_heads = num_KV_heads
         self.num_of_pipelines = num_of_pipelines
-        assert d == 64, "Only d=64 is supported in this version"
+        assert d in (64, 128), "Only d=64 and d=128 are supported in this version"
 
         # Artifacts created by set_up_artifacts()
         self.xclbin_artifact = None
@@ -83,6 +94,23 @@ class AIEMHA(AIEOperatorBase):
             "zero_bf16": "zero_bf16_rowmaj",
             "zero_scalar_bf16": "zero_scalar_bf16_rowmaj",
         }
+        # PV matmul: contracts over B_kv and produces a (B_q x d) output, so it
+        # needs its own mm instantiation (DIM_K=B_kv, DIM_N=d). At d=64 this
+        # coincides with the rowmaj unit above, which is why one served both.
+        mm_defines_pv = [
+            "-Dbf16_bf16_ONLY",
+            f"-DDIM_M={self.B_q}",
+            f"-DDIM_K={self.B_kv}",
+            f"-DDIM_N={self.d}",
+            "-DROUND_CONV_EVEN",
+            "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
+        ]
+        mm_rename_symbols_pv = {
+            "matmul_bf16_bf16": "matmul_bf16_bf16_pv",
+            "matmul_scalar_bf16_bf16": "matmul_scalar_bf16_bf16_pv",
+            "zero_bf16": "zero_bf16_pv",
+            "zero_scalar_bf16": "zero_scalar_bf16_pv",
+        }
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -108,7 +136,10 @@ class AIEMHA(AIEOperatorBase):
             depends=[
                 mlir_artifact,
                 KernelArchiveArtifact.new(
-                    f"mha_kernels.a",
+                    # The PV unit makes the archive contents d-dependent
+                    # (DIM_N=d); the name must carry d or a later build with a
+                    # different d silently reuses the stale cached archive.
+                    f"mha_kernels_{self.d}d.a",
                     depends=[
                         KernelObjectArtifact.new(
                             f"mha_mm.o",
@@ -122,11 +153,19 @@ class AIEMHA(AIEOperatorBase):
                             rename_symbols=mm_rename_symbols,
                         ),
                         KernelObjectArtifact.new(
+                            f"mha_mm_pv.o",
+                            extra_flags=mm_defines_pv,
+                            depends=[SourceArtifact.new(mm_source)],
+                            rename_symbols=mm_rename_symbols_pv,
+                        ),
+                        KernelObjectArtifact.new(
                             "mha_softmax.o",
                             depends=[SourceArtifact.new(softmax_source)],
                         ),
                         KernelObjectArtifact.new(
-                            "mha_mha.o", depends=[SourceArtifact.new(mha_source)]
+                            "mha_mha.o",
+                            extra_flags=[f"-DDIM_D={self.d}"],
+                            depends=[SourceArtifact.new(mha_source)],
                         ),
                         KernelObjectArtifact.new(
                             "mha_passThrough.o",
@@ -223,6 +262,19 @@ class AIEMHA(AIEOperatorBase):
             dst = src[:H, :S, :D]
         return dst
 
+    def read_buffer(self, buffer_name, shape, copy=False, dtype=bfloat16):
+        arr = super().read_buffer(buffer_name, shape, copy, dtype)
+        # For d>64 the O stream arrives in kernel C-tile order (o_dims=None in
+        # design.py): un-swizzle to DRAM row-major regardless of the requested
+        # view shape, so buffer-level harnesses see the same layout as
+        # forward().
+        if buffer_name == "O" and self.d > 64:
+            H, d = self.num_heads, self.d
+            S_pad = int(arr.size) // (H * d)
+            fixed = _unswizzle_c_tiles(arr.reshape(H, S_pad, d), d)
+            arr = fixed.reshape(arr.shape)
+        return arr
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         applicable = (
             q.shape[-1] == self.d
@@ -269,7 +321,7 @@ class AIEMHA(AIEOperatorBase):
         # Execute
         self.run_runlist()
 
-        # Read padded output
+        # Read padded output (read_buffer override un-swizzles O for d>64)
         o_padded = self.read_buffer(
             "O", shape=(self.num_heads, S_pad, self.d), dtype=bfloat16
         )

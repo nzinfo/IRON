@@ -118,6 +118,12 @@ def fused_mha(
 ):
 
     of_depth = 2
+    # At d=128 the per-tile footprints double: the QK/PV workers would need
+    # ~83KB of core data memory (cap 64KB) and the Q/O MemTiles ~384KB (cap
+    # 256KB). Fall back to single-buffered object fifos to fit; prefill
+    # throughput takes a hit but correctness is unaffected.
+    if d > 64:
+        of_depth = 1
     vectorized = True
     enable_tracing = True if trace_size > 0 else False
     dtype_str = "bf16"
@@ -205,9 +211,12 @@ def fused_mha(
 
     # AIE kernel declarations
     func_type = "" if vectorized else "_scalar"
-    bin_name = "mha_kernels.a"
+    bin_name = f"mha_kernels_{d}d.a"
 
     zero_kernel = Kernel(f"zero_{dtype_str}", bin_name, [qk_ty])
+
+    # Zero for the PV output tile (B_q x d), provided by the PV mm unit
+    pv_zero_kernel = Kernel(f"zero_{dtype_str}_pv", bin_name, [q_ty])
 
     memcopy_kernel_scale = Kernel(f"passThroughLine", bin_name, [s_ty, s_ty, np.int32])
 
@@ -241,7 +250,7 @@ def fused_mha(
         [
             qk_ty,
             k_ty,
-            qk_ty,
+            q_ty,
             s_ty,
             np.int32,
             np.int32,
@@ -252,7 +261,7 @@ def fused_mha(
     rescale_O = Kernel(
         "rescale_O",
         bin_name,
-        [qk_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
+        [q_ty, s_ty, np.int32, np.ndarray[(2,), np.dtype[np.int32]]],
     )
 
     # AIE-array data movement with object fifos
@@ -260,9 +269,16 @@ def fused_mha(
     if vectorized:
         q_dims = [(B_q // r, r * d), (d // s, s), (r, d), (s, 1)]
 
+    # Access pattern for P (B_q x B_kv) as the A operand of the PV matmul
+    # (same structure as q_dims with the contraction dim B_kv instead of d)
+    p_dims = None
+    if vectorized:
+        p_dims = [(B_q // r, r * B_kv), (B_kv // s, s), (r, B_kv), (s, 1)]
+
     inQ = ObjectFifo(
         np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
         name="inQ",
+        depth=of_depth,
     )
     memQ = inQ.cons().split(
         offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
@@ -276,6 +292,7 @@ def fused_mha(
         inQ2 = ObjectFifo(
             np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
             name="inQ2",
+            depth=of_depth,
         )
         memQ += inQ2.cons().split(
             offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
@@ -307,7 +324,9 @@ def fused_mha(
 
     v_dims = None
     if vectorized:
-        v_dims = [(B_kv // s, s * B_kv), (B_kv // t, t), (s, B_kv), (t, 1)]
+        # V is stored as rows of length d; n-tiles walk within a row (count
+        # d//t, stride t) while k (contraction) steps span rows (stride d)
+        v_dims = [(B_kv // s, s * d), (d // t, t), (s, d), (t, 1)]
 
     inV = ObjectFifo(
         k_ty,
@@ -348,7 +367,7 @@ def fused_mha(
             .cons()
             .forward(
                 name=f"outP{i}",
-                dims_to_stream=q_dims,
+                dims_to_stream=p_dims,
                 depth=of_depth,
                 # placement=Tile(col=i, row=1)
             )
@@ -363,11 +382,21 @@ def fused_mha(
 
     o_dims = None
     if vectorized:
-        o_dims = [(B_q // r, r * B_kv), (r, t), (B_kv // t, r * t), (t, 1)]
+        # O is (B_q x d) in PV C-tile layout; drain delivers DRAM rows of d
+        o_dims = [(B_q // r, r * d), (d // t, t), (r, d), (t, 1)]
+        # d>64: these O-join dims BDs (MemTile col 6/7, D2 wrap=16) are
+        # mis-executed by the hardware (wrap 8 / step x2) -> host output
+        # columns permuted (even d-groups duplicated, odd ones dropped).
+        # Deliver O linearly and un-swizzle on the host instead. The Q/K/V
+        # MM2S BDs carry the same D2 and are measured correct.
+        # See notes/mha-d128-investigation-log.md
+        if d > 64:
+            o_dims = None
     memO = ObjectFifo(
         np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
         name="memO",
         dims_to_stream=o_dims,
+        depth=of_depth,
     )
     outO = memO.prod().join(
         offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
@@ -381,6 +410,7 @@ def fused_mha(
             np.ndarray[(number_of_pipelines_join_distribute * B_q, d), np.dtype[dtype]],
             name="memO2",
             dims_to_stream=o_dims,
+            depth=of_depth,
         )
         outO += memO2.prod().join(
             offsets=[B_q * d * i for i in range(number_of_pipelines_join_distribute)],
@@ -692,7 +722,7 @@ def fused_mha(
                     memV.cons(),
                     scaleOF[i].cons(),
                     outO[i].prod(),
-                    zero_kernel,
+                    pv_zero_kernel,
                     matmul_PV,
                     rescale_O,
                     i,

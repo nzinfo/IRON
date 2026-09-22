@@ -9,12 +9,21 @@
 
 #define VECTOR_LENGTH 64
 
+// Head dimension d of the attention. The O buffer laid out by the PV matmul is
+// (B_q x DIM_D) in C-tile order: z*(8*DIM_D) + n_tile*64 + m_in*8 + lane.
+#ifndef DIM_D
+#define DIM_D 64
+#endif
+
 #define ROUNDING_MODE aie::rounding_mode::conv_even
 
 extern "C" {
 void matmul_scalar_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
 void matmul_bf16_bf16_rowmaj(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
+// PV-dedicated matmul: DIM_M=B_q, DIM_K=B_kv, DIM_N=DIM_D (row-major B)
+void matmul_bf16_bf16_pv(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out);
+void zero_bf16_pv(bfloat16 *buffer);
 void partial_softmax_bf16(bfloat16 *input,
                           bfloat16 *output,
                           bfloat16 *scale_buffer,
@@ -74,16 +83,16 @@ void matmul_PV(bfloat16 *Q,
                 bfloat16 scale_val = scale_row[k];
                 Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
 
-                for (int32_t j = 0; j < 8; j++) {
-                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 512);
+                for (int32_t j = 0; j < DIM_D / 8; j++) {
+                    Vec8bf16 o_vec = aie::load_v<8>(out + j * 64 + k * 8 + l * 8 * DIM_D);
                     o_vec = aie::mul(o_vec, scale_vec);
-                    aie::store_v(out + j * 64 + k * 8 + l * 512, o_vec);
+                    aie::store_v(out + j * 64 + k * 8 + l * 8 * DIM_D, o_vec);
                 }
             }
         }
     }
 
-    matmul_bf16_bf16_rowmaj(Q, K, out);
+    matmul_bf16_bf16_pv(Q, K, out);
 }
 
 void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_buffer)
@@ -113,10 +122,10 @@ void rescale_O(bfloat16 *O, bfloat16 *scale_buffer, int32_t B_q, int32_t *idx_bu
             bfloat16 scale_val = scale_row[k];
             Vec8bf16 scale_vec = aie::broadcast<bfloat16, 8>(scale_val);
 
-            for (int32_t j = 0; j < 8; j++) {
-                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 512);
+            for (int32_t j = 0; j < DIM_D / 8; j++) {
+                Vec8bf16 o_vec = aie::load_v<8>(O + j * 64 + k * 8 + l * 8 * DIM_D);
                 o_vec = aie::mul(o_vec, scale_vec);
-                aie::store_v(O + j * 64 + k * 8 + l * 512, o_vec);
+                aie::store_v(O + j * 64 + k * 8 + l * 8 * DIM_D, o_vec);
             }
         }
     }
