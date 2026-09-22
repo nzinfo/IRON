@@ -31,6 +31,7 @@ list must be made available after calling `compile()`.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+import hashlib
 import os.path
 import zlib
 import logging
@@ -137,6 +138,32 @@ class KernelObjectArtifact(CompilationArtifact):
         super().__init__(path, depends)
         self.extra_flags = extra_flags if extra_flags is not None else []
         self.rename_symbols = rename_symbols if rename_symbols is not None else {}
+
+    def _build_key(self):
+        # Compile flags define the code as much as the source does (e.g. the
+        # -DDIM_* / -DB_COL_MAJ instantiations of the MHA mm kernels). The base
+        # availability check only compares source mtimes, so a cached object
+        # silently survives a flags change and stale code gets linked into the
+        # xclbin (observed: outdated QK matmul -> flat scores -> attention
+        # degenerated to the causal V mean, only in builds that reused an old
+        # build-dir cache). Key the object on its flags too, via a sidecar
+        # file written after each compile.
+        material = repr((sorted(self.extra_flags), sorted(self.rename_symbols.items())))
+        return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+    def build_key_path(self):
+        return self.path.parent / (self.path.name + ".buildkey")
+
+    def is_available(self):
+        if not super().is_available():
+            return False
+        key_file = self.build_key_path()
+        if not key_file.exists():
+            return False
+        try:
+            return key_file.read_text().strip() == self._build_key()
+        except OSError:
+            return False
 
 
 class KernelArchiveArtifact(CompilationArtifact):
@@ -491,6 +518,12 @@ class PeanoCompilationRule(CompilationRule):
 
             if artifact.rename_symbols:
                 self._rename_symbols(artifact)
+
+            # Record the flags this object was built with (see
+            # KernelObjectArtifact._build_key) so later builds can detect a
+            # flags change even when the source file is untouched.
+            if self.dry_run is None:
+                artifact.build_key_path().write_text(artifact._build_key() + "\n")
 
         return artifacts
 
