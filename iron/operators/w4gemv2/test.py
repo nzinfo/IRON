@@ -15,6 +15,15 @@ params = [
     (2048, 2048, 4, 1, 512, 32),
     (2048, 2048, 4, 16, 512, 32),
     (2048, 2048, 8, 16, 256, 32),
+    # The three MiniCPM5 decode GEMV shapes (8col/16tsi, the engine config):
+    # fused qkv (2560 = q 2048 + k 256 + v 256), fused gate+up (2*6144),
+    # down projection (K = intermediate 6144).
+    (2560, 2048, 8, 16, 320, 32),
+    (12288, 2048, 8, 16, 1536, 32),
+    # down projection: the per-tile data-memory budget is 64 KB (placement
+    # map: A fifo 2x27648 + B 12288 + C 1024 = 68 KB overflows at tsi=8);
+    # tsi=4 tiles are 13824 B -> ~42 KB total.
+    (2048, 6144, 8, 4, 256, 32),
 ]
 
 names = [f"w4gemv2_{M}x{K}_{tsi}tsi_{tso}tso_{cols}col_g{gs}" for M, K, cols, tsi, tso, gs in params]

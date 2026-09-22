@@ -8,10 +8,15 @@
 #include <aie_api/aie.hpp>
 #include <stdint.h>
 
-// Fused INT4-dequant GEMV, v2 — same DDR tile ABI as the upstream
+// Fused INT4-dequant GEMV, v2 — same DDR tile layout as the upstream
 // aie2p/fused_dequant_gemv.cc:
-//   [m * k / 2 bytes packed uint4 weights (low nibble first)]
+//   [m * k / 2 bytes packed int4 weights (two's complement, low nibble first)]
 //   [m * (k / group_size) bf16 scale factors]
+// but SIGNED: nibbles are two's-complement [-8,7] (the int4 unpack chain
+// sign-extends at zero extra cost) and scales are plain symmetric per-group
+// scales — the engine ABI for real weights. The upstream operator's uint4
+// scheme (nibble in [0,15], positive scales, zero-point 0) can only
+// represent non-negative weights, i.e. test data.
 // restructured to break the inner-loop dependency chains that bound the
 // upstream kernel at ~2.4us/row / 2.7% MAC utilization (notes §11-12):
 //   * groups alternate between TWO interleaved accumulators (g%2), so the
@@ -50,13 +55,13 @@ void w4gemv2_matvec(uint32_t m,
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    const uint4 *weights_packed = reinterpret_cast<const uint4 *>(a_in);
+    const int4 *weights_packed = reinterpret_cast<const int4 *>(a_in);
     const uint8_t *scale_bytes = a_in + (size_t)m * k / 2;
     const bfloat16 *scales = reinterpret_cast<const bfloat16 *>(scale_bytes);
     const uint32_t groups_per_row = k / group_size;
 
     for (uint32_t row = 0; row < m; row++) {
-        const uint4 *row_w = weights_packed + (size_t)row * k / 2;
+        const int4 *row_w = weights_packed + (size_t)row * k / 2;
         const bfloat16 *row_s = scales + (size_t)row * groups_per_row;
         const bfloat16 *bp = b_in;
 
@@ -68,12 +73,15 @@ void w4gemv2_matvec(uint32_t m,
         for (; g + 1 < groups_per_row; g += 2) {
 #pragma unroll
             for (uint32_t j = 0; j < 2; j++) {
-                aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(row_w);
-                row_w += block_size / 2; // uint4* arithmetic is byte-based
-                // Dequant chain identical to expand.cc / the upstream kernel.
-                aie::vector<uint8, block_size> as_u8 = aie::unpack(I0);
-                aie::vector<uint16, block_size> as_u16 = aie::unpack(as_u8);
-                aie::vector<bfloat16, block_size> w = aie::to_float<bfloat16>(as_u16, 0);
+                aie::vector<int4, block_size> I0 = aie::load_v<block_size>(row_w);
+                row_w += block_size / 2; // int4* arithmetic is byte-based
+                // Dequant chain as in expand.cc, but SIGNED: int4 unpack
+                // sign-extends to int8/int16, so nibbles are two's-complement
+                // [-8,7] and the per-group bf16 scale is the plain symmetric
+                // quantization scale (no zero-point term).
+                aie::vector<int8, block_size> as_i8 = aie::unpack(I0);
+                aie::vector<int16, block_size> as_i16 = aie::unpack(as_i8);
+                aie::vector<bfloat16, block_size> w = aie::to_float<bfloat16>(as_i16, 0);
                 aie::vector<bfloat16, block_size> x = aie::load_v<block_size>(bp);
                 bp += block_size;
                 bfloat16 sf = row_s[g + j];
@@ -89,11 +97,11 @@ void w4gemv2_matvec(uint32_t m,
         }
         // Tail (groups_per_row % 2): depth <= 1, chain cost negligible.
         for (; g < groups_per_row; g++) {
-            aie::vector<uint4, block_size> I0 = aie::load_v<block_size>(row_w);
+            aie::vector<int4, block_size> I0 = aie::load_v<block_size>(row_w);
             row_w += block_size / 2;
-            aie::vector<uint8, block_size> as_u8 = aie::unpack(I0);
-            aie::vector<uint16, block_size> as_u16 = aie::unpack(as_u8);
-            aie::vector<bfloat16, block_size> w = aie::to_float<bfloat16>(as_u16, 0);
+            aie::vector<int8, block_size> as_i8 = aie::unpack(I0);
+            aie::vector<int16, block_size> as_i16 = aie::unpack(as_i8);
+            aie::vector<bfloat16, block_size> w = aie::to_float<bfloat16>(as_i16, 0);
             aie::vector<bfloat16, block_size> x = aie::load_v<block_size>(bp);
             bp += block_size;
             bfloat16 sf = row_s[g];
