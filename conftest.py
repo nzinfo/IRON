@@ -152,6 +152,38 @@ def pytest_configure(config):
         "markers", "metrics(**patterns): specify metric patterns for this test"
     )
 
+    # The firmware allows only 16 concurrent HW contexts, but the mlir_aie
+    # default context cache for this device class holds 32 entries and its
+    # load() only evicts on ENOENT -- not the EINVAL amdxdna returns once the
+    # budget is exhausted. A pytest session touching many distinct xclbins
+    # (the process-global DefaultNPURuntime keeps every context) therefore
+    # dies on CREATE_HWCTX EINVAL after the 16th unique kernel. Clamp the
+    # FIFO cache well under the budget so entries are evicted (and their HW
+    # contexts freed) *before* the 17th load. Per-test usage stays at ~1
+    # context, so eviction never hits a live handle here; model inference
+    # (many live kernels) does not run under pytest and is unaffected.
+    # (Also sidesteps the XRT_CONTEXT_CACHE_SIZE env var, which mlir_aie
+    # reads as a string.)
+    import gc
+
+    from aie.utils import DefaultNPURuntime
+    from aie.utils.hostruntime.xrtruntime.hostruntime import CachedXRTRuntime
+
+    DefaultNPURuntime._cache_size = 4
+
+    # The evicted pyxrt context objects sit in reference cycles, so dropping
+    # the cache entry does not free the underlying DRM context until a GC
+    # pass runs (mlir_aie's own ENOENT retry path knows this and collects;
+    # the proactive path does not). Wrap _evict to always collect, otherwise
+    # the eviction above still leaks contexts on GC timing luck.
+    _orig_evict = CachedXRTRuntime._evict
+
+    def _evict_with_gc(self):
+        _orig_evict(self)
+        gc.collect()
+
+    CachedXRTRuntime._evict = _evict_with_gc
+
 
 def pytest_sessionfinish(session, exitstatus):
     if hasattr(session.config, "_csv_reporter"):
