@@ -4,6 +4,7 @@
 
 import sys
 import pytest
+import numpy as np
 from pathlib import Path
 
 
@@ -12,7 +13,7 @@ from iron.operators.elementwise_add.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
 
-def generate_test_params(extensive=False):
+def generate_test_params(extensive=False, dtype="bf16"):
     max_aie_columns = 8
     num_channels = 2
     input_lengths = [2048] if not extensive else [1024, 4096, 8192]
@@ -24,15 +25,17 @@ def generate_test_params(extensive=False):
             tile_size = input_length // num_aie_columns
             if tile_size * num_aie_columns != input_length:
                 continue
-            names.append(
-                f"eltwise_add_{num_aie_columns}_cols_{num_channels}_channels_{input_length}_tile_{tile_size}"
-            )
-            params.append((input_length, num_aie_columns, num_channels, tile_size))
+            name = f"eltwise_add_{num_aie_columns}_cols_{num_channels}_channels_{input_length}_tile_{tile_size}"
+            if dtype != "bf16":
+                name += f"_{dtype}"
+            names.append(name)
+            params.append((input_length, num_aie_columns, num_channels, tile_size, dtype))
     return params, names
 
 
 regular_params, regular_names = generate_test_params(extensive=False)
 extensive_params, extensive_names = generate_test_params(extensive=True)
+i8_params, i8_names = generate_test_params(extensive=False, dtype="i8")
 
 # Combine params with marks - extensive params get pytest.mark.extensive
 all_params = [
@@ -41,6 +44,9 @@ all_params = [
 ] + [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
+] + [
+    pytest.param(*params, id=name)
+    for params, name in zip(i8_params, i8_names)
 ]
 
 
@@ -49,28 +55,41 @@ all_params = [
     Bandwidth=r"Effective Bandwidth: (?P<value>[\d\.e\+-]+) GB/s",
 )
 @pytest.mark.parametrize(
-    "input_length,num_aie_columns,num_channels,tile_size",
+    "input_length,num_aie_columns,num_channels,tile_size,dtype",
     all_params,
 )
 def test_elementwise_add(
-    input_length, num_aie_columns, num_channels, tile_size, aie_context
+    input_length, num_aie_columns, num_channels, tile_size, dtype, aie_context
 ):
-    golden_ref = generate_golden_reference(input_length=input_length)
+    golden_ref = generate_golden_reference(input_length=input_length, dtype=dtype)
 
     operator = AIEElementwiseAdd(
         size=input_length,
         num_aie_columns=num_aie_columns,
         num_channels=num_channels,
         tile_size=tile_size,
+        dtype=dtype,
         context=aie_context,
     )
 
     input_buffers = {"input1": golden_ref["A"], "input2": golden_ref["B"]}
     output_buffers = {"output": golden_ref["C"]}
 
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
-    )
+    if dtype == "i8":
+        # integer add must match bit-exactly: integer mismatches differ by >= 1,
+        # while the eps-level bound stays below 1e-6, so nothing can slip through
+        # (nearly_equal rejects rel_tol < float32 eps outright)
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=np.finfo(np.float32).eps,
+            abs_tol=0,
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.04, abs_tol=1e-6
+        )
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")

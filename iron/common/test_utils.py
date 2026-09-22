@@ -32,8 +32,11 @@ def nearly_equal(
 def verify_buffer(operator, buf_name, reference, rel_tol=0.04, abs_tol=1e-6):
     errors = []
     expected_np = torch_to_numpy(reference).reshape((-1,))
-    buf_size = operator.buffers[buf_name] // 2
-    output = operator.read_buffer(buf_name, (buf_size,))
+    # Interpret the buffer in the reference's dtype (bf16 references keep the
+    # historical 2-byte element count; integer dtypes count their own itemsize).
+    dtype = expected_np.dtype
+    buf_size = operator.buffers[buf_name] // np.dtype(dtype).itemsize
+    output = operator.read_buffer(buf_name, (buf_size,), dtype=dtype)
     if len(output) < len(expected_np):
         # Allow larger buffers - binning may have allocated more space than needed
         print(

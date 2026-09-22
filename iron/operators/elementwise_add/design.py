@@ -15,7 +15,7 @@ from aie.iron.controlflow import range_
 from aie.helpers.util import np_ndarray_type_get_shape
 
 
-def my_eltwise_add(dev, num_elements, num_columns, num_channels, tile_size, trace_size):
+def my_eltwise_add(dev, num_elements, num_columns, num_channels, tile_size, trace_size, dtype="bf16"):
     per_tile_elements = 4096 if tile_size > 4096 else tile_size
     n = per_tile_elements * num_columns
     if num_elements % n != 0:
@@ -24,11 +24,19 @@ def my_eltwise_add(dev, num_elements, num_columns, num_channels, tile_size, trac
         )
     N_div_n = num_elements // n
     chunk = num_elements // num_columns
-    dtype = bfloat16
+
+    if dtype == "bf16":
+        np_dtype = bfloat16
+        kernel_symbol = "eltwise_add_bf16_vector"
+    elif dtype == "i8":
+        np_dtype = np.int8
+        kernel_symbol = "eltwise_add_i8_vector"
+    else:
+        raise ValueError(f"Unsupported dtype ({dtype}); expected 'bf16' or 'i8'.")
 
     # Define tensor types
-    tensor_ty = np.ndarray[(num_elements,), np.dtype[dtype]]
-    tile_ty = np.ndarray[(per_tile_elements,), np.dtype[dtype]]
+    tensor_ty = np.ndarray[(num_elements,), np.dtype[np_dtype]]
+    tile_ty = np.ndarray[(per_tile_elements,), np.dtype[np_dtype]]
 
     # AIE-array data movement with object fifos (one per column, not per channel)
     of_in1s = [ObjectFifo(tile_ty, name=f"in1_{i}") for i in range(num_columns)]
@@ -37,7 +45,7 @@ def my_eltwise_add(dev, num_elements, num_columns, num_channels, tile_size, trac
 
     # AIE Core Function declaration
     eltwise_add_bf16_vector = Kernel(
-        "eltwise_add_bf16_vector", "add.o", [tile_ty, tile_ty, tile_ty, np.int32]
+        kernel_symbol, "add.o", [tile_ty, tile_ty, tile_ty, np.int32]
     )
 
     # Define a task that will run on a compute tile
@@ -165,6 +173,14 @@ if __name__ == "__main__":
     p.add_argument(
         "-t", "--trace-size", required=True, dest="trace_size", help="Trace size"
     )
+    # Compute dtype: bf16 (default) or i8
+    p.add_argument(
+        "--dtype",
+        required=False,
+        dest="dtype",
+        default="bf16",
+        help="Compute dtype: bf16 or i8",
+    )
     p.add_argument(
         "--output-file-path",
         "-o",
@@ -199,7 +215,7 @@ if __name__ == "__main__":
         raise ValueError
     trace_size = int(opts.trace_size) if opts.trace_size is not None else 0
 
-    module = my_eltwise_add(dev, length, columns, channels, tile_size, trace_size)
+    module = my_eltwise_add(dev, length, columns, channels, tile_size, trace_size, opts.dtype)
 
     output_file_path = Path(opts.output_file_path)
 

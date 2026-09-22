@@ -53,4 +53,10 @@ void eltwise_add_bf16_vector(bfloat16 *a_in, bfloat16 *b_in, bfloat16 *c_out, in
     eltwise_vadd<bfloat16, bfloat16>(a_in, b_in, c_out, size);
 }
 
+// int8 x int8 -> int8 (wraps mod 256, same as two's-complement add)
+void eltwise_add_i8_vector(int8_t *a_in, int8_t *b_in, int8_t *c_out, int size)
+{
+    eltwise_vadd<int8_t, int8_t>(a_in, b_in, c_out, size);
+}
+
 } // extern "C"

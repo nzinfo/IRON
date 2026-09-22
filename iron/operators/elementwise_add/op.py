@@ -28,6 +28,7 @@ class AIEElementwiseAdd(AIEOperatorBase):
         num_aie_columns=None,
         num_channels=None,
         tile_size=None,
+        dtype="bf16",
         context=None,
     ):
         max_multiple = num_aie_columns * tile_size
@@ -35,6 +36,13 @@ class AIEElementwiseAdd(AIEOperatorBase):
         self.orig_size = size
         self.size = padded_size
         self.tile_size = tile_size
+        self.dtype = dtype
+        if dtype == "bf16":
+            self.np_dtype = bfloat16
+        elif dtype == "i8":
+            self.np_dtype = np.int8
+        else:
+            raise ValueError(f"Unsupported dtype ({dtype}); expected 'bf16' or 'i8'.")
 
         self.num_aie_columns = num_aie_columns
         self.num_channels = num_channels
@@ -53,6 +61,9 @@ class AIEElementwiseAdd(AIEOperatorBase):
         # Compilation artifacts
         operator_dir = Path(__file__).parent
         file_name_base = f"add_{self.num_aie_columns}c_{self.num_channels}ch_{self.size}_{self.tile_size}t"
+        if self.dtype != "bf16":
+            # dtype variants share add.o but get their own mlir/xclbin/insts
+            file_name_base += f"_{self.dtype}"
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
             f"{file_name_base}.mlir",
@@ -65,6 +76,7 @@ class AIEElementwiseAdd(AIEOperatorBase):
                 self.num_channels,
                 self.tile_size,
                 0,
+                self.dtype,
             ],
         )
 
@@ -95,9 +107,9 @@ class AIEElementwiseAdd(AIEOperatorBase):
 
     def set_up_runtime(self):
         # Runtime setup
-        self.add_buffer("input1", self.size)
-        self.add_buffer("input2", self.size)
-        self.add_buffer("output", self.size)
+        self.add_buffer("input1", self.size, dtype=self.np_dtype)
+        self.add_buffer("input2", self.size, dtype=self.np_dtype)
+        self.add_buffer("output", self.size, dtype=self.np_dtype)
         self.add_kernel(
             "eltwise_add",
             self.xclbin_artifact,
@@ -162,9 +174,9 @@ class AIEElementwiseAdd(AIEOperatorBase):
 
         self.write_buffer("input1", x_flat)
         self.write_buffer("input2", y_flat)
-        test_pattern = np.zeros(len(x_flat), dtype=bfloat16)
+        test_pattern = np.zeros(len(x_flat), dtype=self.np_dtype)
         self.write_buffer("output", test_pattern)
         self.run_runlist()
-        result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=bfloat16)
+        result = self.read_buffer_as_torch("output", shape=x_flat.shape, dtype=self.np_dtype)
 
         return result
