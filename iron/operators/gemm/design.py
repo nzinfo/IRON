@@ -33,6 +33,8 @@ microkernel_mac_dim_map = {
             True: (8, 8, 8),
             False: (4, 8, 8),
         },
+        # native int8 MAC (mm.cc i8 combos): 8x8x8 regardless of emulation
+        "i8": (8, 8, 8),
     },
 }
 
@@ -65,11 +67,13 @@ def main():
         default=None,
         help="Name of the archive file for the AIE kernels",
     )
-    argparser.add_argument("--dtype_in", type=str, choices=["bf16"], default="bf16")
+    argparser.add_argument(
+        "--dtype_in", type=str, choices=["bf16", "i8"], default="bf16"
+    )
     argparser.add_argument(
         "--dtype_out",
         type=str,
-        choices=["bf16", "f32"],
+        choices=["bf16", "f32", "i32"],
         default="bf16",
     )
     argparser.add_argument("--trace_size", type=int, default=0)

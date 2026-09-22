@@ -18,9 +18,24 @@ def generate_golden_reference(
     torch.manual_seed(seed)
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
-    input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
-    input_b_full = torch.rand(K, N, dtype=dtype_torch) * val_range
-    output_full = torch.matmul(input_a, input_b_full)
+    if dtype_torch.is_floating_point:
+        input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
+        input_b_full = torch.rand(K, N, dtype=dtype_torch) * val_range
+        output_full = torch.matmul(input_a, input_b_full)
+    else:
+        # Integer route (int8 in / int32 out): small values so the exact
+        # integer accumulation never overflows i32 (|sum| <= 16*K).
+        # torch type promotion would wrap int8@int8 back to int8, so widen
+        # before the matmul.
+        input_a = torch.randint(
+            -val_range, val_range + 1, (M, K), dtype=dtype_torch
+        )
+        input_b_full = torch.randint(
+            -val_range, val_range + 1, (K, N), dtype=dtype_torch
+        )
+        output_full = torch.matmul(
+            input_a.to(torch.int32), input_b_full.to(torch.int32)
+        )
     if False:
         # The following inputs are useful for debugging;
         # the A matrix becomes a matrix where each element encodes its row and column index,

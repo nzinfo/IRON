@@ -4,6 +4,7 @@
 
 import sys
 import pytest
+import numpy as np
 from pathlib import Path
 
 
@@ -12,7 +13,7 @@ from iron.operators.gemm.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
 
-def generate_test_params(extensive=False):
+def generate_test_params(extensive=False, dtype_in="bf16", dtype_out="bf16"):
     # fmt: off
     params = [
         #   M,     K,     N, num_aie_columns, b_col_maj, c_col_maj,   m,   k,   n, trace_size, partition_N
@@ -24,8 +25,8 @@ def generate_test_params(extensive=False):
         ( 896,  1792,   640,               8,     False,      True,  32,  64,  80,          0,           1),
         ( 192,   384,    64,               4,     False,     False,  48,  96,  16,          0,           1),
         ( 192,   384,    64,               4,      True,      True,  48,  96,  16,          0,           1),
-    ]                                                                                          
-    extensive_params = [                                                                       
+    ]
+    extensive_params = [
         (2048,  2048,  2048,               8,     False,     False,  32,  32, 128,          0,           1),
         (2048,  2048,  8192,               2,     False,     False,  64,  64,  64,          0,           1),
         (2048,  8192,  2048,               2,     False,     False,  64,  64,  64,          0,           1),
@@ -42,9 +43,17 @@ def generate_test_params(extensive=False):
         (2048,    64,  2048,               2,     False,      True,  64,  64,  64,          0,           1),
         (2048,    64,  8192,               2,     False,      True,  64,  64,  64,          0,           1),
     ]
+    # int8 native-MAC route (q8 route A): small correctness case plus one
+    # full-array throughput case.
+    int8_params = [
+        ( 192,   384,    64,               4,     False,     False,  48,  96,  16,          0,           1),
+        (2048,  2048,  2048,               8,     False,     False,  32,  32, 128,          0,           1),
+    ]
     # fmt: on
 
-    if extensive:
+    if dtype_in == "i8":
+        params = int8_params
+    elif extensive:
         params = extensive_params
 
     names = []
@@ -70,6 +79,8 @@ def generate_test_params(extensive=False):
             name += f"_{partition_N}npart"
         if trace_size > 0:
             name += f"_{trace_size}trace"
+        if dtype_in != "bf16":
+            name += f"_{dtype_in}_{dtype_out}"
         names.append(name)
 
     return params, names
@@ -77,6 +88,9 @@ def generate_test_params(extensive=False):
 
 regular_params, regular_names = generate_test_params(extensive=False)
 extensive_params, extensive_names = generate_test_params(extensive=True)
+int8_params, int8_names = generate_test_params(
+    extensive=False, dtype_in="i8", dtype_out="i32"
+)
 
 # Combine params with marks - extensive params get pytest.mark.extensive
 all_params = [
@@ -85,6 +99,9 @@ all_params = [
 ] + [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
+] + [
+    pytest.param(*params, id=name)
+    for params, name in zip(int8_params, int8_names)
 ]
 
 
@@ -110,11 +127,19 @@ def test_gemm(
     trace_size,
     partition_N,
     aie_context,
+    request,
 ):
+    # The int8 params carry their dtype in the test id (last _i8_i32 token);
+    # everything else is bf16.
+    is_int8 = request.node.callspec.id.endswith("_i8_i32")
+    dtype_in = "i8" if is_int8 else "bf16"
+    dtype_out = "i32" if is_int8 else "bf16"
+
     golden_ref = generate_golden_reference(
         M=M,
         K=K,
         N=N,
+        dtype=dtype_in,
         partition_N=partition_N,
         b_col_maj=b_col_maj,
         c_col_maj=c_col_maj,
@@ -133,6 +158,8 @@ def test_gemm(
         b_col_maj=b_col_maj,
         c_col_maj=c_col_maj,
         partition_N=partition_N,
+        dtype_in=dtype_in,
+        dtype_out=dtype_out,
         context=aie_context,
     )
 
@@ -145,9 +172,20 @@ def test_gemm(
     for i in range(partition_N):
         input_buffers[f"B_{i}"] = golden_ref["input_b"][i].flatten()
         output_buffers[f"C_{i}"] = golden_ref["output"][i].flatten()
-    errors, latency_us, bandwidth_gbps = run_test(
-        operator, input_buffers, output_buffers, rel_tol=0.005, abs_tol=0.005
-    )
+    if is_int8:
+        # Integer MAC with an i32 accumulator is exact: any mismatch differs
+        # by >= 1, so a sub-1e-6 relative tolerance can never mask one.
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator,
+            input_buffers,
+            output_buffers,
+            rel_tol=np.finfo(np.float32).eps,
+            abs_tol=0,
+        )
+    else:
+        errors, latency_us, bandwidth_gbps = run_test(
+            operator, input_buffers, output_buffers, rel_tol=0.005, abs_tol=0.005
+        )
 
     gflops = (2.0 * M * K * N) / (latency_us * 1e-6) / 1e9
 

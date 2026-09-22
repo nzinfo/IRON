@@ -19,6 +19,7 @@ from iron.common import (
 )
 
 from iron.common.utils import torch_to_numpy, numpy_to_torch
+from aie.iron import str_to_dtype
 
 
 class AIEGEMM(AIEOperatorBase):
@@ -47,6 +48,18 @@ class AIEGEMM(AIEOperatorBase):
         self.tile_n = tile_n
         self.num_aie_columns = num_aie_columns
         self.gemm_args = gemm_kwargs
+
+        # Quantized-compute route A: native int8 MAC with a wide integer
+        # accumulator (mm.cc i8_i32_ONLY). Block-scale requantization happens
+        # in a follow-on op, never inside this one.
+        self.dtype_in = gemm_kwargs.get("dtype_in", "bf16")
+        self.dtype_out = gemm_kwargs.get("dtype_out", "bf16")
+        if self.dtype_in == "i8":
+            assert (
+                self.dtype_out == "i32"
+            ), f"int8 input requires i32 output (got {self.dtype_out})"
+        self.np_dtype_in = str_to_dtype(self.dtype_in)
+        self.np_dtype_out = str_to_dtype(self.dtype_out)
 
         # Set frequently accessed gemm_args
         self.b_col_maj = gemm_kwargs.get("b_col_maj", False)
@@ -94,16 +107,22 @@ class AIEGEMM(AIEOperatorBase):
 
         b_col_maj = self.b_col_maj
         c_col_maj = self.c_col_maj
-        dtype_in = self.gemm_args.get("dtype_in", "bf16")
-        dtype_out = self.gemm_args.get("dtype_out", "bf16")
+        dtype_in = self.dtype_in
+        dtype_out = self.dtype_out
+        is_int8 = dtype_in == "i8"
         emulate_bf16_mmul_with_bfp16 = self.gemm_args.get(
             "emulate_bf16_mmul_with_bfp16", True
         )
         prio_accuracy = self.gemm_args.get("prio_accuracy", False)
+        if is_int8:
+            # The i32 accumulator is exact integer math; no bf16 accuracy
+            # knobs apply (design.py asserts dtype_out==bf16 for prio).
+            prio_accuracy = False
+            emulate_bf16_mmul_with_bfp16 = False
         use_scalar = self.gemm_args.get("use_scalar", False)
         round_conv_even = self.gemm_args.get("round_conv_even", True)
 
-        if emulate_bf16_mmul_with_bfp16:
+        if is_int8 or emulate_bf16_mmul_with_bfp16:
             min_tile_m, min_tile_k, min_tile_n = 8, 8, 8
         else:
             min_tile_m, min_tile_k, min_tile_n = 4, 8, 8
@@ -111,30 +130,35 @@ class AIEGEMM(AIEOperatorBase):
         assert tile_k >= min_tile_k, f"tile_k ({tile_k}) must be >= {min_tile_k}"
         assert tile_n >= min_tile_n, f"tile_n ({tile_n}) must be >= {min_tile_n}"
 
+        # Distinct artifact names per dtype so bf16 caches stay untouched and
+        # int8 objects never collide with same-tile bf16 ones.
+        dtype_sfx = f"_{dtype_in}_{dtype_out}" if is_int8 else ""
         file_name_tile_base = f"{prefix}{tile_m}x{tile_k}x{tile_n}"
-        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}"
+        file_name_total_base = f"{prefix}{M}x{K}x{N}_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}{dtype_sfx}"
         xclbin_kernel_name = f"gemm_{file_name_tile_base}"
         kernel_flags = [
             f"-DDIM_M={tile_m}",
             f"-DDIM_K={tile_k}",
             f"-DDIM_N={tile_n}",
-            "-DROUND_CONV_EVEN",
         ]
-        if prio_accuracy:
-            kernel_flags.append("-Dbf16_f32_ONLY")
+        if is_int8:
+            kernel_flags.append("-Di8_i32_ONLY")
         else:
-            kernel_flags.append("-Dbf16_bf16_ONLY")
-        if round_conv_even:
-            kernel_flags.append("-DROUND_CONV_EVEN")
-        if emulate_bf16_mmul_with_bfp16:
-            kernel_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
+            if prio_accuracy:
+                kernel_flags.append("-Dbf16_f32_ONLY")
+            else:
+                kernel_flags.append("-Dbf16_bf16_ONLY")
+            if round_conv_even:
+                kernel_flags.append("-DROUND_CONV_EVEN")
+            if emulate_bf16_mmul_with_bfp16:
+                kernel_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
         if b_col_maj:
             kernel_flags.append("-DB_COL_MAJ")
         if c_col_maj:
             kernel_flags.append("-DC_COL_MAJ")
 
         kernel_archive = (
-            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.a"
+            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}{dtype_sfx}.a"
         )
 
         mlir_artifact = PythonGeneratedMLIRArtifact.new(
@@ -181,7 +205,7 @@ class AIEGEMM(AIEOperatorBase):
                     kernel_archive,
                     depends=[
                         KernelObjectArtifact.new(
-                            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}.o",
+                            f"gemm_{tile_m}x{tile_k}x{tile_n}_{int(b_col_maj)}_{int(c_col_maj)}{dtype_sfx}.o",
                             extra_flags=kernel_flags,
                             depends=[
                                 SourceArtifact.new(
@@ -236,15 +260,16 @@ class AIEGEMM(AIEOperatorBase):
             self.xclbin_artifact.kernel_name,
             self.insts_artifact,
         )
-        self.add_buffer("A", self.M * self.K)
+        self.add_buffer("A", self.M * self.K, dtype=self.np_dtype_in)
         B_parts = self._partition_B(static_weights)
         for i, B_part in enumerate(B_parts):
             self.add_buffer(
                 f"B_{i}",
                 self.K * self.N,
+                dtype=self.np_dtype_in,
                 static_data=B_part,
             )
-            self.add_buffer(f"C_{i}", self.M * self.N)
+            self.add_buffer(f"C_{i}", self.M * self.N, dtype=self.np_dtype_out)
             self.add_to_runlist("gemm", "A", f"B_{i}", f"C_{i}")
 
     def _get_B_dims(self, B_shape):
@@ -400,12 +425,13 @@ class AIEGEMM(AIEOperatorBase):
             for i, B_np in enumerate(B_nps):
                 self.add_buffer(
                     f"B_{i}",
-                    self.M * self.N,
+                    self.K * self.N,
+                    dtype=self.np_dtype_in,
                     static_data=B_np,
                 )
         self.run_runlist()
         result_nps = [
-            self.read_buffer(f"C_{i}", shape=C_shape, dtype=bfloat16)
+            self.read_buffer(f"C_{i}", shape=C_shape, dtype=self.np_dtype_out)
             for i in range(self.partition_N)
         ]
 
