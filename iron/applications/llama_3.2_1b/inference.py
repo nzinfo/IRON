@@ -329,8 +329,8 @@ def inference(
         context_size=model.cfg["context_length"],
         eos_id=tokenizer.special["<|end_of_text|>"],
         hook_handles=hook_handles,
-        temperature=0.7,
-        top_k=50,
+        temperature=args.temperature,
+        top_k=args.top_k if args.temperature > 0 else None,
         tokenizer=tokenizer,
         prompt=truncated_prompt,
         prefill_done_callback=set_prefill_time,
@@ -410,6 +410,18 @@ if __name__ == "__main__":
         type=int,
         default=2048,
         help="Truncate prompt to this many tokens.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature (0 = greedy/argmax decoding).",
+    )
+    parser.add_argument(
+        "--top_k",
+        type=int,
+        default=50,
+        help="Top-k sampling (ignored when temperature is 0).",
     )
     parser.add_argument(
         "--profile",
