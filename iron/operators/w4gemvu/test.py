@@ -40,7 +40,9 @@ def test_w4gemvu(M, K, aie_context):
 
     input_buffers = {
         "packed_weights": torch.from_numpy(golden_ref["packed_weights"]),
-        "vector": golden_ref["x"],
+        # The vector buffer holds F padded copies of x (one per B fifo
+        # element) — a bare (K,) tensor would leave slots 2..F stale.
+        "vector": operator.replicate_vector(golden_ref["x"]),
     }
     output_buffers = {"output": golden_ref["output"]}
 

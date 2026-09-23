@@ -16,7 +16,7 @@ from aie.iron.device import NPU1, NPU2
 
 """
 UNIVERSAL fused INT4-dequant GEMV (M3b): one PDI for every projection
-shape. The kernel reads K from a self-describing tile header at runtime,
+shape. The kernel reads K from a self-describing slot tail at runtime,
 so the device side (workers, fifos, placement) is IDENTICAL for all
 shapes and only the ctrl-code differs per (M, K) — run-w4layer showed
 every CU switch costs ~650us of PDI reload; with all ops on one CU the
@@ -36,8 +36,13 @@ compiled PDI is bit-identical):
     double-buffered tiles; the K=2048 fill moves ~3x the bytes but the
     AIE reads only the live prefix, so its consumption rate is
     unchanged and the padding lands on the shim DMA engines.
-  - B fifo element = K_MAX*2 = 12288 B (K=2048 ops fill the first 4 KB
-    and zero-pad the slot); depth 1, refilled every tile.
+  - B fifo element = K_MAX*2 = 12288 B (K=2048 ops zero-pad the slot);
+    depth 2 (ping-pong, same shape as the A path). The activation is
+    streamed as ONE multi-element fill per column: the DDR vector buffer
+    holds F = tiles_per_col/TILES_PER_B copies of x back to back (host
+    replicates it), so the fill is a single large BD with a positive
+    stride — untapped per-element fills would need F shim BDs and the
+    allocator caps a channel at 16 (gate_up F=24 exhausts it).
   - C fifo element = m_input bf16 = 8 B; depth 2.
 
 Variant parameters (ctrl-code only): M (rows) and K (2048 or 6144) ->
@@ -84,8 +89,9 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
     L1_C_ty = np.ndarray[(M_INPUT,), dtype_out]
 
     # L3 (DDR) types
+    b_elems = (tiles_per_col // TILES_PER_B) * K_MAX
     L3_A_ty = np.ndarray[(packed_total_bytes,), dtype_in]
-    L3_B_ty = np.ndarray[(K_MAX,), dtype_vec]
+    L3_B_ty = np.ndarray[(b_elems,), dtype_vec]
     L3_C_ty = np.ndarray[(M,), dtype_out]
 
     fused_matvec = Kernel(
@@ -105,7 +111,7 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
         for i in range(cols)
     ]
     B_L3L1_fifos = [
-        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=1) for i in range(cols)
+        ObjectFifo(L1_B_ty, name=f"B_L3L1_{i}", depth=2) for i in range(cols)
     ]
     C_L1L3_fifos = [
         ObjectFifo(L1_C_ty, name=f"C_L1L3_{i}", depth=2) for i in range(cols)
@@ -162,6 +168,15 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
         )
         for col in range(cols)
     ]
+    B_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, b_elems),
+            offset=0,
+            sizes=[1, 1, 1, b_elems],
+            strides=[0, 0, 0, 1],
+        )
+        for _ in range(cols)
+    ]
 
     rt = Runtime()
     with rt.sequence(L3_A_ty, L3_B_ty, L3_C_ty) as (A, B, C):
@@ -169,13 +184,13 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
         tg = rt.task_group()
         for i in range(cols):
             rt.fill(A_L3L1_fifos[i].prod(), A, A_taps[i], task_group=tg)
-            # One B element per TILES_PER_B tiles: N untapped fills each
-            # move a single element from the SAME activation address (a
-            # repeat tap needs stride 0, which NPU BDs reject). The BDs
-            # flow-control through the depth-1 fifo via locks, exactly
-            # like the 80-element A fill into its depth-2 fifo.
-            for _r in range(tiles_per_col // TILES_PER_B):
-                rt.fill(B_L3L1_fifos[i].prod(), B, task_group=tg)
+            # One multi-element B fill per column: the vector buffer holds
+            # F copies of the activation, so the stream shape mirrors the
+            # proven A fill (one big BD, positive stride). Untapped
+            # per-element fills would need F shim BDs per channel and the
+            # allocator caps a channel at 16 (gate_up F=24 exhausts it);
+            # a stride-0 repeat tap is rejected by NPU BDs.
+            rt.fill(B_L3L1_fifos[i].prod(), B, B_taps[i], task_group=tg)
         for i in range(cols):
             rt.drain(
                 C_L1L3_fifos[i].cons(),

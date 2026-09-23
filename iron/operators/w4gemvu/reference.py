@@ -6,12 +6,14 @@
 Quantization is the same signed-int4 ABI as w4gemv2 (per-group-32
 symmetric, scale = amax/7 bf16, nibbles two's-complement low-first).
 The DDR layout differs: every tile is a SELF-DESCRIBING PADDED SLOT —
+layout v2, built for the peano anchor quirk (see w4gemvu.cc):
 
-  [0..4)   K as u32
-  [4..8)   reserved (zero)
-  [8..8+m*K/2)        nibbles
-  [.. +m*(K/32)*2)    bf16 scales
-  [.. pad to 13840)   one ELEM slot per tile for every K
+  [0 .. m*K/2)      row-major nibbles (row r at r*K/2)
+  [ .. +8)          junk hole
+  [ .. +m*(K/32)*2) bf16 scales
+  [ .. 13832)       pad
+  [13832..13836)    K as u32
+  [ .. 13840)       reserved
 
 so one element geometry serves every shape and the fills stay
 element-aligned (notes §14). acquire(1) per tile keeps the kernel's
@@ -65,16 +67,19 @@ def quantize_and_pack(W, group_size=32, m_input=4, cols=8):
         for t in range(tiles_per_col):
             row_start = col * (M // cols) + t * m_input
             off = (col * tiles_per_col + t) * slot_bytes
-            # Self-describing header.
-            packed[off : off + 4] = np.frombuffer(k_le, dtype=np.uint8)
+            # Layout v2: nibbles at 0 (row-major), 8-byte hole, scales,
+            # K in the fixed slot tail. The anchors match what the
+            # compiled kernel actually reads (peano drops the +8 on the
+            # int4 weight stream; scales and the K load keep theirs).
             rows = q_np[row_start : row_start + m_input]
             lo = rows[:, :, 0::2].astype(np.uint8) & 0x0F
             hi = rows[:, :, 1::2].astype(np.uint8) & 0x0F
             nibbles = (lo | (hi << 4)).reshape(m_input, K // 2)
-            packed[off + 8 : off + 8 + m_input * K // 2] = nibbles.reshape(-1)
+            packed[off : off + m_input * K // 2] = nibbles.reshape(-1)
             s = scale_np[row_start : row_start + m_input]
-            o = off + 8 + m_input * K // 2
+            o = off + m_input * K // 2 + 8
             packed[o : o + m_input * num_groups_per_row * 2] = s.reshape(-1).view(np.uint8)
+            packed[off + ELEM - 8 : off + ELEM - 4] = np.frombuffer(k_le, dtype=np.uint8)
 
     return packed, W_dequant
 

@@ -61,6 +61,14 @@ class AIEW4GEMVU(AIEOperatorBase):
 
         AIEOperatorBase.__init__(self, context=context)
 
+    def _b_reps(self):
+        """F: activation copies in the DDR vector buffer (one per B fifo
+        element). A single multi-element fill keeps the shim BD count at
+        one per channel — per-element fills would need F BDs and gate_up
+        (F=24) exhausts the allocator's 16."""
+        tiles_per_col = self.M // self.num_aie_columns // 4
+        return tiles_per_col // 16
+
     def _packed_buffer_size(self):
         tiles_per_col = self.M // self.num_aie_columns // 4
         return self.num_aie_columns * tiles_per_col * ELEMS_PER_TILE * ELEM
@@ -110,9 +118,10 @@ class AIEW4GEMVU(AIEOperatorBase):
 
     def set_up_runtime(self):
         self.add_buffer("packed_weights", self._packed_buffer_size(), dtype=np.uint8)
-        # The B fifo slot is K_MAX wide for every variant; activations for
-        # K=2048 occupy the first 2048 elements and zero-pad the rest.
-        self.add_buffer("vector", K_MAX, dtype=bfloat16)
+        # The B stream is one multi-element fill: the vector buffer holds
+        # F copies of the activation back to back (F = self._b_reps()).
+        # Each B fifo slot is K_MAX wide; K=2048 activations zero-pad.
+        self.add_buffer("vector", self._b_reps() * K_MAX, dtype=bfloat16)
         self.add_buffer("output", self.M, dtype=bfloat16)
         self.add_kernel(
             "w4gemvu",
@@ -122,15 +131,29 @@ class AIEW4GEMVU(AIEOperatorBase):
         )
         self.add_to_runlist("w4gemvu", "packed_weights", "vector", "output")
 
-    def forward(self, vector, packed_weights=None):
-        """vector: bf16 (K,) — the first K entries are the activation."""
+    def replicate_vector(self, vector):
+        """Expand a (K,) activation into the F-slot DDR vector buffer
+        (each K_MAX-wide B slot holds x zero-padded). forward() and any
+        direct write_buffer("vector", ...) caller must use this — a bare
+        (K,) tensor only covers the first slot and leaves the rest stale.
+        """
         if vector.shape[-1] != self.K or vector.dtype != torch.bfloat16:
             raise AIEOperatorConstraintError(
                 f"AIEW4GEMVU: expected bf16 vector of length {self.K}, "
                 f"got shape {tuple(vector.shape)} dtype {vector.dtype}"
             )
+        reps = self._b_reps()
+        if self.K == K_MAX:
+            return vector.repeat(reps)
+        vb = torch.zeros(reps * K_MAX, dtype=torch.bfloat16)
+        for r in range(reps):
+            vb[r * K_MAX : r * K_MAX + self.K] = vector
+        return vb
+
+    def forward(self, vector, packed_weights=None):
+        """vector: bf16 (K,) — the activation; replicated F times internally."""
         if packed_weights is not None:
             self.write_buffer("packed_weights", packed_weights)
-        self.write_buffer("vector", vector)
+        self.write_buffer("vector", self.replicate_vector(vector))
         self.run_runlist()
         return self.read_buffer_as_torch("output", (self.M,))

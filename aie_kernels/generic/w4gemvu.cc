@@ -18,20 +18,33 @@
 // taps) differs per shape — no CU switch, no PDI reload (the ~650us/op
 // switch cost measured by run-w4layer disappears).
 //
-// Tile layout (self-describing, unit = one fifo element of 13840 bytes):
-//   [0..4)   K as u32 (little-endian)
-//   [4..8)   reserved (zero)
-//   [8..8+m*K/2)            packed int4 nibbles (low nibble first)
-//   [.. +m*(K/32)*2)        bf16 per-group-32 scales
-//   [.. pad to 13840)       K=2048 tiles carry 9224 B of DDR padding
+// Tile layout v2 (self-describing, unit = one fifo element of 13840 bytes):
+//   [0 .. m*K/2)      row-major packed int4 nibbles (row r at r*K/2)
+//   [ .. +8)          8-byte junk hole
+//   [ .. +m*(K/32)*2) bf16 per-group-32 scales (row-major)
+//   [ .. 13832)       pad (K=2048 tiles carry ~9.2 KB of DDR padding)
+//   [13832..13836)    K as u32 (little-endian)
+//   [13836..13840)    reserved
 // Every tile is ONE element (acquire(1)): the core simply reads only K
 // columns. m (rows per tile) stays a compiled-in constant (4).
+//
+// ANCHOR QUIRK (peano -O2, verified by unit-vector fingerprinting on
+// hardware): the int4 weight stream pointer compiled from `a_in + 8`
+// reads from `a_in + 0` — the +8 byte offset is silently dropped on the
+// movs/padda streaming path — while the indexed scale loads keep it, and
+// so does the scalar K load. The layout above is built for the EFFECTIVE
+// anchors: weights land at a_in+0 (the nibble start), scales at
+// a_in+8+m*K/2 (just past the hole), K at the fixed slot tail. Do not
+// "fix" the source anchors without re-fingerprinting: writing a_in+0
+// explicitly may get shifted again.
 //
 // STACK BUDGET — the peano linker reserves only 0x400 bytes of stack and
 // the placer puts the neighbor fifo buffer directly above it (notes §12);
 // this loop shape matches w4gemv2's 2-accumulator form (0x1c0 frame),
 // verified safe. Do not widen the interleave without re-checking
 // `paddxm [sp], #imm` in the ELF.
+
+constexpr uint32_t kSlotBytes = 13840; // ELEM: one padded max-K tile slot
 
 template <uint32_t block_size>
 void w4gemvu_matvec(uint32_t m,
@@ -44,8 +57,9 @@ void w4gemvu_matvec(uint32_t m,
 
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    // Self-describing tile: K comes from the tile header, not the ELF.
-    const uint32_t k = *(const uint32_t *__restrict)a_in;
+    // Self-describing tile: K comes from the fixed slot tail, not the ELF
+    // (a_in+0 is the nibble start now — see the anchor-quirk note above).
+    const uint32_t k = *(const uint32_t *__restrict)(a_in + kSlotBytes - 8);
     const uint8_t *tile = a_in + 8;
     const int4 *weights_packed = reinterpret_cast<const int4 *>(tile);
     const uint8_t *scale_bytes = tile + (size_t)m * k / 2;
