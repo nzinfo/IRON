@@ -69,6 +69,7 @@ def generate_golden_reference(
     head_dim=64,
     seq_len=128,
     seed=42,
+    k_val_range=None,
 ):
     """Generate golden reference data for FlowKV decode attention with fused RoPE.
 
@@ -104,11 +105,17 @@ def generate_golden_reference(
 
     # Use small value range to keep bf16 precision reasonable
     val_range = 2
+    # K scale override: k_val_range << val_range flattens the softmax over a
+    # long cache (denominator l reaches O(100+)). That regime once hid a bf16
+    # accumulation bug (l recursed in bf16 dropped every sub-half-ULP term,
+    # leaving l at ~60% of true) which the default sharp data never exercised.
+    if k_val_range is None:
+        k_val_range = val_range
 
     # Generate inputs in bf16 for hardware-accurate reference
-    Q = torch.randn(num_heads, head_dim, dtype=torch.bfloat16) * val_range
+    Q = torch.randn(num_heads, head_dim, dtype=torch.bfloat16) * k_val_range
     K_cache_raw = (
-        torch.randn(num_kv_heads, seq_len, head_dim, dtype=torch.bfloat16) * val_range
+        torch.randn(num_kv_heads, seq_len, head_dim, dtype=torch.bfloat16) * k_val_range
     )
     V_cache = (
         torch.randn(num_kv_heads, seq_len, head_dim, dtype=torch.bfloat16) * val_range

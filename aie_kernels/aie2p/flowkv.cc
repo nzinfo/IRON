@@ -230,7 +230,19 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         aie::vector<bfloat16, 16> corr_exp = aie::exp2<bfloat16>(corr_acc.to_vector<float>());
         float c_correction = static_cast<float>(corr_exp[0]);
 
-        bfloat16 l_new_bf16 = static_cast<bfloat16>(c_correction * l_old);
+        // Accumulate l in f32: once l ~ O(100+) the bf16 ULP is 0.5..1, so
+        // the old bf16 recursion `l = bf16(l + f)` silently dropped every
+        // typical f (~0.05 < half-ULP) — a systematic downward bias that
+        // left l at ~60% of true and scaled O by 1/a with a in [1.5,1.9]
+        // per head. Uniform test data (all f == 1, exact in bf16) was immune,
+        // which is why the fixture pytest never caught it.
+        //
+        // Quantize C_c to bf16 FIRST and use its f32 image both here and in
+        // the packed output: the value core rescales Y with the bf16 value
+        // it reads from the inter element, so l must recurse with the SAME
+        // C_c or Y and l drift apart chunk by chunk.
+        bfloat16 c_corr_bf16 = static_cast<bfloat16>(c_correction);
+        float l_new = static_cast<float>(c_corr_bf16) * l_old;
 
         // Compute exp2 for each score position — one at a time, no float arrays
         for (int pos = 0; pos < chunk_size; pos++) {
@@ -239,17 +251,19 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
             aie::accum<accfloat, 16> diff_acc(diff_vec);
             aie::vector<bfloat16, 16> exp_result = aie::exp2<bfloat16>(diff_acc.to_vector<float>());
             bfloat16 f_bf16 = exp_result[0];
-            l_new_bf16 = static_cast<bfloat16>(static_cast<float>(l_new_bf16) + static_cast<float>(f_bf16));
+            l_new += static_cast<float>(f_bf16);
             scores_out[pos * num_q_heads + h] = f_bf16;
         }
 
         // Update running state
         score_running_max[h] = m_new;
-        score_running_sum[h] = static_cast<float>(l_new_bf16);
+        score_running_sum[h] = l_new;
 
-        // Write correction and denominator to packed buffer
-        correction_out[h] = static_cast<bfloat16>(c_correction);
-        denom_out[h] = l_new_bf16;
+        // Write correction and denominator to packed buffer. l crosses the
+        // inter as bf16 — one final rounding, <=0.4% worst case, which the
+        // value core's saved_denom inherits for the normalize.
+        correction_out[h] = c_corr_bf16;
+        denom_out[h] = static_cast<bfloat16>(l_new);
     }
 
     cur_chunk_base += chunk_size;

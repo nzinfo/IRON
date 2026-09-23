@@ -105,14 +105,23 @@ def test_flowkv_decode(
     output_buffers = {"output": golden_ref["O"]}
 
     # Online softmax + bf16 GEMV accumulates rounding error across chunks.
-    # Tolerance ladder: standalone ops use 0.04/1e-6, composed operators
-    # like SwiGLU use 0.07/1.0. FlowKV is similarly composed.
+    # abs_tol was 1.0 (the composed-operator ladder), which masked a real
+    # bug: a bf16-recursed softmax denominator left outputs scaled
+    # ~1.5-1.9x per head on flat-softmax data. With that fixed, the
+    # remaining floor is quantization inside the kernel's bf16 score path:
+    # scores AND the exp2 argument round to bf16, so at this data's
+    # max|s|~14 the argument ULP (~0.08 at diff*log2e ~ -20) perturbs
+    # weights by ~5% (the f32-score reference has none of this). Measured
+    # worst case 0.17 at one head's four elements; 0.25 floors it with
+    # headroom while any whole-output scale drift >= ~25% fails. The
+    # flat-softmax test below is the dedicated denominator tripwire at a
+    # 6x tighter floor (small scores -> microscopic quantization).
     errors, latency_us, bandwidth_gbps = run_test(
         operator,
         input_buffers,
         output_buffers,
         rel_tol=0.07,
-        abs_tol=1.0,
+        abs_tol=0.25,
     )
 
     print(f"\nLatency (us): {latency_us:.1f}")
@@ -181,6 +190,57 @@ def test_flowkv_decode_runtime_seq(aie_context):
             {"kv_cache": padded.reshape(-1), "queries": q_packed},
             {"output": golden_ref["O"]},
             rel_tol=0.07,
-            abs_tol=1.0,
+            abs_tol=0.25,
         )
         assert not errors, f"S={S} failed with errors: {errors}"
+
+
+def test_flowkv_decode_flat_softmax(aie_context):
+    """Large-denominator regime: K scaled to keep scores ~N(0, 0.6^2) so the
+    softmax over a 1024-slot cache stays flat (l ~ O(1000)) while weights
+    still vary a few x (O magnitudes ~0.3). The bf16 l-recursion bug lived
+    exactly here — each typical f (~0.05) sat below half a bf16 ULP once
+    l > ~128 and was silently dropped, shrinking the denominator to ~60%
+    and scaling O by 1/l_used (errors ~0.2 here, far past the 0.04 floor).
+    The default sharp data (peaked softmax, l ~ O(1)) never exercised it.
+    Small scores also keep the bf16 score-ULP noise microscopic, so this
+    case runs at the tight 0.04 floor. Same compiled shape as the MiniCPM5
+    decode fixture.
+    """
+    num_heads, num_kv_heads, head_dim = 16, 2, 128
+    seq_len, chunk_size, num_cols = 1024, 32, 2
+    group_size = num_heads // num_kv_heads
+
+    golden_ref = generate_golden_reference(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        k_val_range=0.6,
+    )
+
+    operator = AIEFlowKVDecode(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len=seq_len,
+        chunk_size=chunk_size,
+        num_cols=num_cols,
+        context=aie_context,
+    )
+
+    q_packed = pack_q_with_angles(
+        golden_ref["Q"],
+        golden_ref["q_angles"],
+        group_size,
+        num_kv_heads,
+    )
+
+    errors, _, _ = run_test(
+        operator,
+        {"kv_cache": golden_ref["KV_interleaved"], "queries": q_packed},
+        {"output": golden_ref["O"]},
+        rel_tol=0.07,
+        abs_tol=0.04,
+    )
+    assert not errors, f"flat-softmax case failed with errors: {errors}"
