@@ -33,22 +33,34 @@
 #include <stdint.h>
 #include <type_traits>
 
+// Static buffers are sized for the largest supported geometry (group_size
+// heads x head_dim, e.g. 8 x 128 for MiniCPM5 GQA 16Q/2KV), not the
+// llama-1B 4 x 64 the kernel was originally written for. Loops stay bound
+// by the runtime num_q_heads/head_dim arguments.
+#define FLOWKV_MAX_QH 16
+#define FLOWKV_MAX_D 128
+
 // ---------------------------------------------------------------------------
 // Score tile: static softmax state (only used by score tile Worker)
 // ---------------------------------------------------------------------------
-static float score_running_max[4] __attribute__((aligned(64)));
-static float score_running_sum[4] __attribute__((aligned(64)));
+static float score_running_max[FLOWKV_MAX_QH] __attribute__((aligned(64)));
+static float score_running_sum[FLOWKV_MAX_QH] __attribute__((aligned(64)));
 
 // RoPE-rotated Q vectors (written by score_rope_q, read by score_chunk)
-static bfloat16 rotated_q[4 * 64] __attribute__((aligned(64)));
+static bfloat16 rotated_q[FLOWKV_MAX_QH * FLOWKV_MAX_D] __attribute__((aligned(64)));
+
+// Runtime sequence length (from the Q element header) and the sequence
+// position of the chunk currently being processed by score_chunk.
+static int32_t cur_seq_len;
+static int32_t cur_chunk_base;
 
 // ---------------------------------------------------------------------------
 // Value tile: accumulated output in f32 for precision
 // ---------------------------------------------------------------------------
-static float value_accum[4 * 64] __attribute__((aligned(64)));
+static float value_accum[FLOWKV_MAX_QH * FLOWKV_MAX_D] __attribute__((aligned(64)));
 
 // Saved denominator from the last chunk (written by accum, read by normalize)
-static float saved_denom[4] __attribute__((aligned(64)));
+static float saved_denom[FLOWKV_MAX_QH] __attribute__((aligned(64)));
 
 extern "C" {
 
@@ -63,16 +75,39 @@ void flowkv_score_init_bf16(int32_t num_q_heads)
     }
 }
 
+// Q element header: FLOWKV_Q_HDR_ELEMS bf16 values (32 B) at the END of the
+// Q FIFO element, AFTER the Q data and the angles. The header must sit at
+// the tail because the RoPE loop's q_head/angles base pointers are peano
+// streaming-pointer anchors: prepending anything before the Q data makes
+// peano -O2 drop the constant offset from the angles load base (notes §13 /
+// §16 — the same class of bug as the w4gemvu nibble-stream +8). With the
+// upstream [Q | angles] prefix the anchors compile correctly and only the
+// scalar tail read carries the header. The first two header elements hold
+// the runtime sequence length S (positions 0..S-1 live; 0 = full capacity)
+// as a u32 split across the two bf16 bit patterns (little-endian halves).
+// Must match Q_HDR_ELEMS in iron/operators/flowkv_decode/design.py.
+#define FLOWKV_Q_HDR_ELEMS 16
+
 // Apply RoPE rotation to all Q heads and store in static buffer.
-// The Q FIFO buffer layout is [Q_heads (group_size * head_dim) | angles (head_dim)]
+// The Q FIFO buffer layout is
+//   [Q_heads (gs*hd) | angles (hd) | hdr (FLOWKV_Q_HDR_ELEMS)]
 // where angles are interleaved [cos0, sin0, cos1, sin1, ...] for head_dim/2 pairs.
-// Uses the "two halves" method: for head_dim=64:
+// Uses the "two halves" method (for head_dim=64 shown; any multiple of 32):
 //   rotated[0:32]  = q[0:32]  * cos - q[32:64] * sin
 //   rotated[32:64] = q[32:64] * cos + q[0:32]  * sin
 //
-// q_in: pointer to Q FIFO buffer (Q heads followed by angles)
-void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_heads, int32_t head_dim)
+// q_in: pointer to Q FIFO buffer (Q heads, angles, header)
+// seq_len_cap: the compiled cache capacity (constant baked into the ctrl
+// code). A header S of 0 means "full capacity" so legacy callers that pack
+// no header get the pre-header behaviour instead of an all-dead NaN run.
+void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_heads, int32_t head_dim, int32_t seq_len_cap)
 {
+    // Runtime sequence length from the header (u32 in the first 2 elements).
+    const bfloat16 *hdr = q_in + num_q_heads * head_dim + head_dim;
+    uint32_t s_hdr = *(const uint32_t *)(hdr);
+    cur_seq_len = (s_hdr == 0) ? seq_len_cap : (int32_t)s_hdr;
+    cur_chunk_base = 0;
+
     const int32_t half_dim = head_dim / 2;
     const bfloat16 *angles = q_in + num_q_heads * head_dim;
 
@@ -128,12 +163,17 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
     event0();
     ::aie::set_rounding(aie::rounding_mode::conv_even);
 
-    const float inv_sqrt_d = 0.125f; // 1/sqrt(64) = 1/8
+    // 1/sqrt(head_dim) for the supported head dims (math.h is unavailable
+    // under NOCPP; the exact f32 constants keep the reference bit-stable).
+    const float inv_sqrt_d =
+        (head_dim == 128) ? 0.08838834764831845f : 0.125f;
 
     const int32_t scores_size = chunk_size * num_q_heads;
     bfloat16 *scores_out = packed_out;
     bfloat16 *correction_out = packed_out + scores_size;
     bfloat16 *denom_out = packed_out + scores_size + num_q_heads;
+
+    const int32_t chunk_base = cur_chunk_base;
 
     for (int h = 0; h < num_q_heads; h++) {
         const bfloat16 *q_head = rotated_q + h * head_dim;
@@ -148,18 +188,29 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         for (int pos = 0; pos < chunk_size; pos++) {
             const bfloat16 *k_pos = k_chunk + pos * head_dim;
 
-            // Vectorized dot product: head_dim=64 using single accum
+            // Vectorized dot product. The mac offsets MUST stay compile-time
+            // constants (fully unrolled): peano spills the dynamic-offset
+            // loop form, and any stack frame beyond the 0x400 peano stack
+            // lands in the neighbouring K fifo buffer (notes §12/§16).
             aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+            acc = aie::mac(acc, aie::load_v<32>(q_head), aie::load_v<32>(k_pos));
+            acc = aie::mac(acc, aie::load_v<32>(q_head + 32), aie::load_v<32>(k_pos + 32));
+            if (head_dim == 128) {
+                acc = aie::mac(acc, aie::load_v<32>(q_head + 64), aie::load_v<32>(k_pos + 64));
+                acc = aie::mac(acc, aie::load_v<32>(q_head + 96), aie::load_v<32>(k_pos + 96));
+            }
+            float s_val = aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d;
 
-            auto q_vec0 = aie::load_v<32>(q_head);
-            auto k_vec0 = aie::load_v<32>(k_pos);
-            acc = aie::mac(acc, q_vec0, k_vec0);
-
-            auto q_vec1 = aie::load_v<32>(q_head + 32);
-            auto k_vec1 = aie::load_v<32>(k_pos + 32);
-            acc = aie::mac(acc, q_vec1, k_vec1);
-
-            bfloat16 score = static_cast<bfloat16>(aie::reduce_add(acc.to_vector<float>()) * inv_sqrt_d);
+            // Dead row (pos >= runtime S): clamp to the -1e30 sentinel. The
+            // sentinel makes exp2((score - m_new) * log2e) == 0 and never
+            // wins the chunk max, so the online softmax update naturally
+            // leaves C_c = 1, F_c = 0 and l unchanged — dead chunks are
+            // algebraically neutral, no special-casing downstream. Scalar
+            // select only: keep branches out of the vector path.
+            if (chunk_base + pos >= cur_seq_len) {
+                s_val = -1e30f;
+            }
+            bfloat16 score = static_cast<bfloat16>(s_val);
 
             scores_bf16[pos] = score;
             if (static_cast<float>(score) > static_cast<float>(m_chunk_bf16)) {
@@ -201,6 +252,7 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         denom_out[h] = l_new_bf16;
     }
 
+    cur_chunk_base += chunk_size;
     event1();
 }
 

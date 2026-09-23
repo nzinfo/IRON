@@ -19,6 +19,10 @@ def generate_test_params(extensive=False):
             (32, 8, 64, 256, 32, 4),
             (32, 8, 64, 512, 32, 8),
             (32, 8, 64, 1024, 32, 4),
+            # MiniCPM5-2B decode shape: 16 Q heads, 2 KV heads, d=128.
+            # num_kv_heads=2 limits num_cols to {1, 2}.
+            (16, 2, 128, 256, 32, 2),
+            (16, 2, 128, 1024, 32, 2),
         ]
     names = [
         f"flowkv_decode_{nh}h_{nkv}kv_{d}d_{s}s_{cs}cs_{nc}col"
@@ -27,6 +31,11 @@ def generate_test_params(extensive=False):
     return params, names
 
 
+# 8 columns need 8 distinct shim DMA tiles; npu2 (Strix Halo) does not have
+# that many usable shim columns, so the SequentialPlacer fails to resolve
+# this shape regardless of kernel code. Verified failing at upstream HEAD.
+NO_PLACE = {"flowkv_decode_32h_8kv_64d_512s_32cs_8col"}
+
 regular_params, regular_names = generate_test_params(extensive=False)
 extensive_params, extensive_names = generate_test_params(extensive=True)
 
@@ -34,7 +43,15 @@ all_params = [
     pytest.param(*params, id=name)
     for params, name in zip(regular_params, regular_names)
 ] + [
-    pytest.param(*params, marks=pytest.mark.extensive, id=name)
+    pytest.param(
+        *params,
+        marks=(
+            [pytest.mark.extensive, pytest.mark.skip(reason="exceeds npu2 shim column budget")]
+            if name in NO_PLACE
+            else [pytest.mark.extensive]
+        ),
+        id=name,
+    )
     for params, name in zip(extensive_params, extensive_names)
 ]
 
@@ -107,3 +124,63 @@ def test_flowkv_decode(
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s\n")
 
     assert not errors, f"Test failed with errors: {errors}"
+
+
+def test_flowkv_decode_runtime_seq(aie_context):
+    """One compiled binary (cache capacity 128) serving several live lengths.
+
+    The runtime sequence length S rides in the Q element header; cache rows
+    at positions >= S still stream (the persistent workers' acquire counts
+    are compiled in) and must be neutralized by the kernel's dead-row
+    sentinel. S=1 is the first decode step (chunk 0 row 0 live, everything
+    else dead), S=101 splits the last live chunk mid-way (intra-chunk
+    masking), S=128 is the full-capacity regression. Reuses ONE operator
+    instance across all S values — the daemon usage pattern.
+    """
+    import torch
+
+    num_heads, num_kv_heads, head_dim = 16, 2, 128
+    cache_seq, chunk_size, num_cols = 128, 32, 2
+    group_size = num_heads // num_kv_heads
+
+    operator = AIEFlowKVDecode(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len=cache_seq,
+        chunk_size=chunk_size,
+        num_cols=num_cols,
+        context=aie_context,
+    )
+
+    for S in (1, 33, 101, 128):
+        golden_ref = generate_golden_reference(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            seq_len=S,
+        )
+        # Zero-pad the interleaved cache to the compiled capacity: dead V
+        # rows must be finite (0 x F_c=0), dead K rows may hold anything.
+        live = golden_ref["KV_interleaved"].view(num_kv_heads, S, 2, head_dim)
+        padded = torch.zeros(
+            num_kv_heads, cache_seq, 2, head_dim,
+            dtype=golden_ref["KV_interleaved"].dtype,
+        )
+        padded[:, :S] = live
+
+        q_packed = pack_q_with_angles(
+            golden_ref["Q"],
+            golden_ref["q_angles"],
+            group_size,
+            num_kv_heads,
+            seq_len_cur=S,
+        )
+        errors, _, _ = run_test(
+            operator,
+            {"kv_cache": padded.reshape(-1), "queries": q_packed},
+            {"output": golden_ref["O"]},
+            rel_tol=0.07,
+            abs_tol=1.0,
+        )
+        assert not errors, f"S={S} failed with errors: {errors}"

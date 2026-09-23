@@ -44,9 +44,12 @@ sequence iterates over batches of `num_cols` groups.
 DDR buffer layout (3 sequence args):
   arg0: KV cache -- interleaved K and V per position per head.
         Shape: (num_kv_heads, seq_len, 2, head_dim) flattened.
-  arg1: Q vectors + RoPE angles -- per KV group: Q heads then interleaved cos/sin.
-        Layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
-        Shape: (num_kv_heads * (group_size * head_dim + head_dim),) flattened.
+  arg1: Q vectors + RoPE angles -- per KV group: Q heads, then interleaved
+        cos/sin, then a 16-elem header (runtime sequence length u32 in the
+        first two bf16 bit patterns). The header trails so the kernel's RoPE
+        base pointers keep the upstream (headerless) anchor layout.
+        Layout: [Q_group0 (gs*hd) | angles (hd) | hdr | Q_group1 ...]
+        Shape: (num_kv_heads * (group_size * head_dim + head_dim + 16),) flattened.
   arg2: Output -- attention result.
         Shape: (num_heads, head_dim) flattened.
 """
@@ -73,9 +76,18 @@ def my_flowkv_decode(
     # -------------------------------------------------------------------------
     # L1 tile types
     # -------------------------------------------------------------------------
-    # Query vectors for one KV group, plus RoPE angles (head_dim interleaved
-    # cos/sin values) packed at the end.
-    L1_Q_ty = np.ndarray[(group_size * head_dim + head_dim,), dtype_in]
+    # Query vectors for one KV group, then RoPE angles (head_dim interleaved
+    # cos/sin values), then a 16-element (32 B) header at the END carrying
+    # the runtime sequence length as a u32 in the first two bf16 bit
+    # patterns (see flowkv.cc FLOWKV_Q_HDR_ELEMS). The header must trail:
+    # the kernel's RoPE base pointers have to stay identical to the upstream
+    # headerless layout, or peano -O2 drops the constant offset from the
+    # angles streaming pointer (notes §13/§16). The design still
+    # streams/fills the full compiled seq_len; the kernel neutralizes cache
+    # rows at positions >= the header's S, so one compiled binary serves
+    # every decode step of a cache slot (the w4gemvu runtime-K trick).
+    Q_HDR_ELEMS = 16
+    L1_Q_ty = np.ndarray[(group_size * head_dim + head_dim + Q_HDR_ELEMS,), dtype_in]
 
     # K or V chunk
     L1_KV_chunk_ty = np.ndarray[(chunk_size * head_dim,), dtype_in]
@@ -92,9 +104,9 @@ def my_flowkv_decode(
     # L3 (DDR) buffer types
     # -------------------------------------------------------------------------
     L3_KV_ty = np.ndarray[(num_kv_heads * seq_len * 2 * head_dim,), dtype_in]
-    # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | Q_group1 (gs*hd) | angles (hd) | ...]
-    # Each group block = group_size * head_dim + head_dim contiguous bf16 values.
-    q_group_stride = group_size * head_dim + head_dim
+    # Q DDR layout: [Q_group0 (gs*hd) | angles (hd) | hdr(16) | Q_group1 ...]
+    # Each group block = group_size * head_dim + head_dim + Q_HDR_ELEMS bf16 values.
+    q_group_stride = group_size * head_dim + head_dim + Q_HDR_ELEMS
     L3_Q_ty = np.ndarray[(num_kv_heads * q_group_stride,), dtype_in]
     L3_O_ty = np.ndarray[(num_heads * head_dim,), dtype_in]
 
@@ -111,9 +123,10 @@ def my_flowkv_decode(
         "flowkv_score_rope_q_bf16",
         "flowkv.o",
         [
-            L1_Q_ty,  # q_in (Q heads + packed angles)
+            L1_Q_ty,  # q_in (Q heads + angles + trailing header)
             np.int32,  # num_q_heads
             np.int32,  # head_dim
+            np.int32,  # seq_len cap (header S==0 means full capacity)
         ],
     )
 
@@ -186,8 +199,10 @@ def my_flowkv_decode(
             # Acquire Q (held for all chunks in this attention computation)
             q = q_fifo.acquire(1)
 
-            # Apply RoPE rotation to Q and store in static buffer
-            score_rope_q_fn(q, group_size, head_dim)
+            # Apply RoPE rotation to Q and store in static buffer. seq_len is
+            # the compiled cache capacity (constant); the runtime live length
+            # rides in the Q element header.
+            score_rope_q_fn(q, group_size, head_dim, seq_len)
 
             # Stream through K chunks
             for _ in range_(num_chunks):
