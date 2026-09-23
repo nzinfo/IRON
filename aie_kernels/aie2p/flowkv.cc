@@ -143,6 +143,40 @@ void flowkv_score_rope_q_bf16(const bfloat16 *__restrict q_in, int32_t num_q_hea
     }
 }
 
+// Accurate scalar 2^x for x <= 0, returns bf16.
+//
+// The AIE2P hardware elementary ::exp2 (the only exp2 aie_api offers with
+// bf16 output) carries a VALUE-DEPENDENT relative error of mean +3.3% /
+// max +5.7% over arg in [-24, 0]: ~0 at 0 and integers, peaking near
+// frac(arg) = 0.5, period 1 — a coarse fraction polynomial. In the online
+// softmax it biased every weight, inflated l by ~3% and compounded through
+// C_c rescales to 15% on adversarial orderings (tools/fk_exp2_iso.py,
+// notes/perf-lab.md P4). This drop-in keeps the documented input chain
+// (bf16-quantized argument) but evaluates 2^r with a degree-5 f32 Taylor
+// of e^(r*ln2) (rel err ~1e-4 << bf16 half-ULP 0.4%) and scales by 2^n
+// through an exponent-field add. Results below 2^-126 clamp to 0 (l is
+// O(1..1000) and bf16 granularity makes them indistinguishable from 0
+// downstream; the -1e30 dead-row sentinel lands here too).
+static inline bfloat16 flowkv_exp2_accurate(float x)
+{
+    if (x <= -126.0f)
+        return static_cast<bfloat16>(0.0f);
+    int n = static_cast<int>(x); // x <= 0: truncate-toward-zero then fix
+    if (x < static_cast<float>(n))
+        --n; // floor, n in [-126, 0]
+    const float r = x - static_cast<float>(n); // [0, 1)
+    const float pr = 1.0f
+                   + r * (0.69314718f
+                   + r * (0.24022651f
+                   + r * (0.055504109f
+                   + r * (0.0096181291f
+                   + r * 0.0013333611f))));
+    union { float f; int32_t i; } v;
+    v.f = pr; // in [1, 2): normal, exact *2^n via exponent-field add
+    v.i += n << 23;
+    return static_cast<bfloat16>(v.f);
+}
+
 // Compute attention scores for one K chunk and update online softmax state.
 // Writes results into a single packed inter-tile buffer.
 // Uses rotated Q from the static buffer (populated by flowkv_score_rope_q_bf16).
@@ -223,12 +257,11 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         float m_new = (m_chunk_f > m_old) ? m_chunk_f : m_old;
         bfloat16 m_new_bf16 = static_cast<bfloat16>(m_new);
 
-        // C_c = exp2((m_old - m_new) * log2e) via vector exp2
+        // C_c = exp2((m_old - m_new) * log2e) — accurate path (see helper):
+        // the hardware bf16 exp2's frac(arg)-dependent +3..6% bias inflated
+        // every rescale and, through them, l and O.
         bfloat16 corr_scaled = static_cast<bfloat16>((m_old - m_new) * 1.4453125f);
-        aie::vector<bfloat16, 16> corr_in_vec = aie::broadcast<bfloat16, 16>(corr_scaled);
-        aie::accum<accfloat, 16> corr_acc(corr_in_vec);
-        aie::vector<bfloat16, 16> corr_exp = aie::exp2<bfloat16>(corr_acc.to_vector<float>());
-        float c_correction = static_cast<float>(corr_exp[0]);
+        float c_correction = static_cast<float>(flowkv_exp2_accurate(static_cast<float>(corr_scaled)));
 
         // Accumulate l in f32: once l ~ O(100+) the bf16 ULP is 0.5..1, so
         // the old bf16 recursion `l = bf16(l + f)` silently dropped every
@@ -244,13 +277,12 @@ void flowkv_score_chunk_bf16(const bfloat16 *__restrict q_in,
         bfloat16 c_corr_bf16 = static_cast<bfloat16>(c_correction);
         float l_new = static_cast<float>(c_corr_bf16) * l_old;
 
-        // Compute exp2 for each score position — one at a time, no float arrays
+        // Compute exp2 for each score position — one at a time, no float
+        // arrays; accurate 2^x (hardware bf16 exp2 biased weights, see
+        // flowkv_exp2_accurate). Chunk-level vectorization deferred.
         for (int pos = 0; pos < chunk_size; pos++) {
             bfloat16 diff = static_cast<bfloat16>((static_cast<float>(scores_bf16[pos]) - m_new) * 1.4453125f);
-            aie::vector<bfloat16, 16> diff_vec = aie::broadcast<bfloat16, 16>(diff);
-            aie::accum<accfloat, 16> diff_acc(diff_vec);
-            aie::vector<bfloat16, 16> exp_result = aie::exp2<bfloat16>(diff_acc.to_vector<float>());
-            bfloat16 f_bf16 = exp_result[0];
+            bfloat16 f_bf16 = flowkv_exp2_accurate(static_cast<float>(diff));
             l_new += static_cast<float>(f_bf16);
             scores_out[pos * num_q_heads + h] = f_bf16;
         }
