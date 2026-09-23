@@ -10,12 +10,13 @@ from iron.operators.w4gemvu.reference import generate_golden_reference
 from iron.common.test_utils import run_test
 
 
-# (M, K): the four MiniCPM5 decode projection shapes plus one small case.
+# (M, K): the MiniCPM5 + hy-mt2 decode projection shapes plus one small case.
 params = [
     (2560, 2048),
     (2048, 2048),
     (12288, 2048),
     (2048, 6144),
+    (3072, 2048),  # hy-mt2 qkv: cat(q 2048, k 512, v 512), 16Q/4KV GQA
 ]
 
 names = [f"w4gemvu_{M}x{K}" for M, K in params]

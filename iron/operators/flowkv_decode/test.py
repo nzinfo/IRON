@@ -23,6 +23,9 @@ def generate_test_params(extensive=False):
             # num_kv_heads=2 limits num_cols to {1, 2}.
             (16, 2, 128, 256, 32, 2),
             (16, 2, 128, 1024, 32, 2),
+            # hy-mt2 1.8B decode shape: 16 Q heads, 4 KV heads (GQA group 4).
+            # 4 cols = 4 shim DMA tiles, inside the npu2 budget.
+            (16, 4, 128, 1024, 32, 4),
         ]
     names = [
         f"flowkv_decode_{nh}h_{nkv}kv_{d}d_{s}s_{cs}cs_{nc}col"
