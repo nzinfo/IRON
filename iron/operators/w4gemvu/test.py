@@ -17,6 +17,9 @@ params = [
     (12288, 2048),
     (2048, 6144),
     (3072, 2048),  # hy-mt2 qkv: cat(q 2048, k 512, v 512), 16Q/4KV GQA
+    # hy-mt2 lm_head: vocab 120818 padded to the M%32 ABI (tied embed).
+    # Same PDI as every other shape — only the ctrl code carries M.
+    (120832, 2048),
 ]
 
 names = [f"w4gemvu_{M}x{K}" for M, K in params]
