@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 
 import pytest
 import torch
 
 from iron.operators.w4gemvu.op import AIEW4GEMVU
-from iron.operators.w4gemvu.reference import generate_golden_reference
+from iron.operators.w4gemvu.reference import (
+    generate_golden_reference,
+    shuffle_output,
+)
 from iron.common.test_utils import run_test
 
 
-# (M, K): the MiniCPM5 + hy-mt2 decode projection shapes plus one small case.
+# (M, K): the MiniCPM5 + hy-mt2 decode projection shapes plus one small
+# case, PADDED to the v3 block ABI (K=2048 -> M % 192 == 0, K=6144 ->
+# M % 64 == 0). Same PDI for every shape — only the ctrl code carries
+# M and K.
 params = [
-    (2560, 2048),
-    (2048, 2048),
-    (12288, 2048),
-    (2048, 6144),
     (3072, 2048),  # hy-mt2 qkv: cat(q 2048, k 512, v 512), 16Q/4KV GQA
-    # hy-mt2 lm_head: vocab 120818 padded to the M%32 ABI (tied embed).
-    # Same PDI as every other shape — only the ctrl code carries M.
-    (120832, 2048),
+    (2112, 2048),  # o_proj, padded 2048 -> 2112 (tiles pack 3/block)
+    (12288, 2048),  # gate_up: cat(gate 6144, up 6144)
+    (2048, 6144),  # down_proj (1 tile/block + 2 zero-row calls)
+    (2688, 2048),  # small case, padded 2560 -> 2688
+    # hy-mt2 lm_head: vocab 120818 padded 120960 (tied embed). Same PDI
+    # as every other shape — only the ctrl code carries M.
+    (120960, 2048),
 ]
 
 names = [f"w4gemvu_{M}x{K}" for M, K in params]
@@ -48,7 +53,11 @@ def test_w4gemvu(M, K, aie_context):
         # element) — a bare (K,) tensor would leave slots 2..F stale.
         "vector": operator.replicate_vector(golden_ref["x"]),
     }
-    output_buffers = {"output": golden_ref["output"]}
+    # The device buffer carries every produced C row (K=6144 has 2/3
+    # interleaved zeros — real rows first in each 12-row group).
+    output_buffers = {
+        "output": shuffle_output(golden_ref["output"], M, K)
+    }
 
     errors, latency_us, _ = run_test(
         operator,

@@ -1,5 +1,4 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
 import torch
@@ -15,21 +14,26 @@ from iron.common import (
     SourceArtifact,
     PythonGeneratedMLIRArtifact,
 )
+from iron.operators.w4gemvu import reference
 
-ELEM = 13840
+ELEM = reference.ELEM  # 13856: one COMPACT block (v3)
 ELEMS_PER_TILE = 1
-K_MAX = 6144
+K_MAX = reference.K_MAX
+CALLS_PER_BLOCK = reference.CALLS_PER_BLOCK
 
 
 class AIEW4GEMVU(AIEOperatorBase):
     """Universal W4 fused dequant GEMV — ONE PDI for every projection
-    shape (notes §13-14): the kernel reads K from a self-describing tile
-    header at runtime, so all (M, K) variants compile a bit-identical
-    device side and differ only in ctrl-code. This is the decode-step
-    answer to the ~650us-per-op PDI-reload cost run-w4layer measured:
-    the whole projection chain runs on a single CU.
+    shape (notes §13-14, P10 v3): the kernel reads K from a
+    self-describing block header at runtime and packs 6144/K tight tiles
+    per block, so all (M, K) variants compile a bit-identical device
+    side and differ only in ctrl-code. This is the decode-step answer to
+    the ~650us-per-op PDI-reload cost run-w4layer measured: the whole
+    projection chain runs on a single CU. v3 compact blocks stream only
+    live bytes (v2 padded every tile to the max-K slot: 3x DDR waste at
+    K=2048, P9's biggest gap item).
 
-    Tile layout and fixed fifo geometry: see design.py.
+    Block layout and fixed fifo geometry: see design.py.
     """
 
     def __init__(
@@ -50,11 +54,19 @@ class AIEW4GEMVU(AIEOperatorBase):
             raise AIEOperatorConstraintError(
                 "M must be a multiple of num_aie_columns * 4 rows/tile"
             )
+        # v3 block ABI: tiles pack 6144/K per block and blocks are even.
+        n = reference.tiles_per_block(K)
+        if (M // num_aie_columns // 4) % n != 0:
+            raise AIEOperatorConstraintError(
+                f"K={K}: M must be a multiple of {num_aie_columns * 4 * n} "
+                f"(tiles pack {n} per block)"
+            )
 
         self.M = M
         self.K = K
         self.num_aie_columns = num_aie_columns
         self.group_size = group_size
+        self.blocks_per_col = reference.blocks_per_col(M, K, 4, num_aie_columns)
 
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -62,16 +74,14 @@ class AIEW4GEMVU(AIEOperatorBase):
         AIEOperatorBase.__init__(self, context=context)
 
     def _b_reps(self):
-        """F: activation copies in the DDR vector buffer (one per B fifo
-        element). A single multi-element fill keeps the shim BD count at
-        one per channel — per-element fills would need F BDs and gate_up
-        (F=24) exhausts the allocator's 16."""
-        tiles_per_col = self.M // self.num_aie_columns // 4
-        return tiles_per_col // 16
+        """F: activation copies in the DDR vector buffer (one B slot per
+        BLOCKS_PER_B blocks — a single multi-element fill keeps the shim
+        BD count at one per channel; per-element fills would need F BDs
+        and gate_up (F=64) exhausts the allocator's 16)."""
+        return self.blocks_per_col // reference.BLOCKS_PER_B
 
     def _packed_buffer_size(self):
-        tiles_per_col = self.M // self.num_aie_columns // 4
-        return self.num_aie_columns * tiles_per_col * ELEMS_PER_TILE * ELEM
+        return self.num_aie_columns * self.blocks_per_col * ELEMS_PER_TILE * ELEM
 
     def set_up_artifacts(self):
         operator_dir = Path(__file__).parent
@@ -122,7 +132,10 @@ class AIEW4GEMVU(AIEOperatorBase):
         # F copies of the activation back to back (F = self._b_reps()).
         # Each B fifo slot is K_MAX wide; K=2048 activations zero-pad.
         self.add_buffer("vector", self._b_reps() * K_MAX, dtype=bfloat16)
-        self.add_buffer("output", self.M, dtype=bfloat16)
+        # The drain covers every produced C row; K=6144 carries 2/3 zero
+        # rows (12-row groups, real rows first) — use forward() to
+        # un-shuffle, or read the raw buffer yourself.
+        self.add_buffer("output", self.output_rows(), dtype=bfloat16)
         self.add_kernel(
             "w4gemvu",
             self.xclbin_artifact,
@@ -130,6 +143,9 @@ class AIEW4GEMVU(AIEOperatorBase):
             self.insts_artifact,
         )
         self.add_to_runlist("w4gemvu", "packed_weights", "vector", "output")
+
+    def output_rows(self):
+        return reference.output_rows(self.M, self.K)
 
     def replicate_vector(self, vector):
         """Expand a (K,) activation into the F-slot DDR vector buffer
@@ -151,9 +167,11 @@ class AIEW4GEMVU(AIEOperatorBase):
         return vb
 
     def forward(self, vector, packed_weights=None):
-        """vector: bf16 (K,) — the activation; replicated F times internally."""
+        """vector: bf16 (K,) — the activation; replicated F times internally.
+        Returns the (M,) real output rows (K=6144 zero rows dropped)."""
         if packed_weights is not None:
             self.write_buffer("packed_weights", packed_weights)
         self.write_buffer("vector", self.replicate_vector(vector))
         self.run_runlist()
-        return self.read_buffer_as_torch("output", (self.M,))
+        raw = self.read_buffer_as_torch("output", (self.output_rows(),))
+        return reference.unshuffle_output(raw, self.M, self.K)
