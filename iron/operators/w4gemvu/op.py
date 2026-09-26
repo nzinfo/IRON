@@ -16,22 +16,22 @@ from iron.common import (
 )
 from iron.operators.w4gemvu import reference
 
-ELEM = reference.ELEM  # 13856: one COMPACT block (v3)
+ELEM = reference.ELEM  # 18560: one 16-row x 2048 MATRIX-UNIT tile (v4)
 ELEMS_PER_TILE = 1
 K_MAX = reference.K_MAX
-CALLS_PER_BLOCK = reference.CALLS_PER_BLOCK
+B_SLOT = reference.B_SLOT  # 6528: x int8 + d bf16 scales
+TILE_ROWS = reference.TILE_ROWS
 
 
 class AIEW4GEMVU(AIEOperatorBase):
     """Universal W4 fused dequant GEMV — ONE PDI for every projection
-    shape (notes §13-14, P10 v3): the kernel reads K from a
-    self-describing block header at runtime and packs 6144/K tight tiles
-    per block, so all (M, K) variants compile a bit-identical device
-    side and differ only in ctrl-code. This is the decode-step answer to
-    the ~650us-per-op PDI-reload cost run-w4layer measured: the whole
-    projection chain runs on a single CU. v3 compact blocks stream only
-    live bytes (v2 padded every tile to the max-K slot: 3x DDR waste at
-    K=2048, P9's biggest gap item).
+    shape (notes §13-14; v4 = P11 matrix-unit tiles): every block is a
+    uniform 16-row x 2048-k tile computed by mmul<4,16,16,int8,int4>
+    (mac_4x16_16x16, 1024 MACs/instr; the v3 fp loop was ISSUE-bound at
+    ~10 vector ops per 32 MACs — P11 probe: ~100 GMAC/s/core, 32x).
+    K=6144 ops stream 3 chunk-blocks per tile (chunk-major) and the
+    host sums the partials. The activation is quantized int8
+    per-group-32 (numerics ABI change vs v2/v3 — goldens bake it in).
 
     Block layout and fixed fifo geometry: see design.py.
     """
@@ -50,23 +50,19 @@ class AIEW4GEMVU(AIEOperatorBase):
             )
         if group_size != 32:
             raise AIEOperatorConstraintError("w4gemvu kernel requires group_size == 32")
-        if M % (num_aie_columns * 4) != 0:
+        # v4 block ABI: 16-row tiles / 8 cols, blocks paired two per B
+        # slot, K=6144 chunk-major pairing — one uniform bound.
+        if M % 256 != 0:
             raise AIEOperatorConstraintError(
-                "M must be a multiple of num_aie_columns * 4 rows/tile"
-            )
-        # v3 block ABI: tiles pack 6144/K per block and blocks are even.
-        n = reference.tiles_per_block(K)
-        if (M // num_aie_columns // 4) % n != 0:
-            raise AIEOperatorConstraintError(
-                f"K={K}: M must be a multiple of {num_aie_columns * 4 * n} "
-                f"(tiles pack {n} per block)"
+                "v4 ABI: M must be a multiple of 256 (16-row tiles x 8 cols, "
+                "blocks paired two per B slot)"
             )
 
         self.M = M
         self.K = K
         self.num_aie_columns = num_aie_columns
         self.group_size = group_size
-        self.blocks_per_col = reference.blocks_per_col(M, K, 4, num_aie_columns)
+        self.blocks_per_col = reference.blocks_per_col(M, K, TILE_ROWS, num_aie_columns)
 
         self.xclbin_artifact = None
         self.insts_artifact = None
@@ -74,10 +70,10 @@ class AIEW4GEMVU(AIEOperatorBase):
         AIEOperatorBase.__init__(self, context=context)
 
     def _b_reps(self):
-        """F: activation copies in the DDR vector buffer (one B slot per
+        """F: activation slots in the DDR vector buffer (one B slot per
         BLOCKS_PER_B blocks — a single multi-element fill keeps the shim
         BD count at one per channel; per-element fills would need F BDs
-        and gate_up (F=64) exhausts the allocator's 16)."""
+        and gate_up (F=48) exhausts the allocator's 16)."""
         return self.blocks_per_col // reference.BLOCKS_PER_B
 
     def _packed_buffer_size(self):
@@ -128,13 +124,12 @@ class AIEW4GEMVU(AIEOperatorBase):
 
     def set_up_runtime(self):
         self.add_buffer("packed_weights", self._packed_buffer_size(), dtype=np.uint8)
-        # The B stream is one multi-element fill: the vector buffer holds
-        # F copies of the activation back to back (F = self._b_reps()).
-        # Each B fifo slot is K_MAX wide; K=2048 activations zero-pad.
-        self.add_buffer("vector", self._b_reps() * K_MAX, dtype=bfloat16)
-        # The drain covers every produced C row; K=6144 carries 2/3 zero
-        # rows (12-row groups, real rows first) — use forward() to
-        # un-shuffle, or read the raw buffer yourself.
+        # The B stream is one multi-element fill: the vector buffer
+        # holds F slots of the packed (x int8, d scales) activation —
+        # each slot carries its chunk's x at 0..2048 and d at K_MAX.
+        self.add_buffer("vector", self._b_reps() * B_SLOT, dtype=np.uint8)
+        # Every C row is live: K=6144 carries the 3 chunk partials in
+        # chunk-major M-row sections — use forward() to sum them.
         self.add_buffer("output", self.output_rows(), dtype=bfloat16)
         self.add_kernel(
             "w4gemvu",
@@ -148,27 +143,27 @@ class AIEW4GEMVU(AIEOperatorBase):
         return reference.output_rows(self.M, self.K)
 
     def replicate_vector(self, vector):
-        """Expand a (K,) activation into the F-slot DDR vector buffer
-        (each K_MAX-wide B slot holds x zero-padded). forward() and any
-        direct write_buffer("vector", ...) caller must use this — a bare
-        (K,) tensor only covers the first slot and leaves the rest stale.
+        """Expand a (K,) bf16 activation into the F-slot DDR vector
+        buffer: quantize int8 per-group-32 and pack each slot's chunk.
+        forward() and any direct write_buffer("vector", ...) caller
+        must use this — a bare (K,) tensor only covers the first slot
+        and leaves the rest stale.
         """
         if vector.shape[-1] != self.K or vector.dtype != torch.bfloat16:
             raise AIEOperatorConstraintError(
                 f"AIEW4GEMVU: expected bf16 vector of length {self.K}, "
                 f"got shape {tuple(vector.shape)} dtype {vector.dtype}"
             )
-        reps = self._b_reps()
-        if self.K == K_MAX:
-            return vector.repeat(reps)
-        vb = torch.zeros(reps * K_MAX, dtype=torch.bfloat16)
-        for r in range(reps):
-            vb[r * K_MAX : r * K_MAX + self.K] = vector
-        return vb
+        q, d, _ = reference.quantize_vector(vector, self.group_size)
+        T = reference.tiles_per_chunk(self.M, self.num_aie_columns)
+        return reference.replicate_quantized(
+            q, d, self.blocks_per_col, T, reference.chunks_per_tile(self.K)
+        )
 
     def forward(self, vector, packed_weights=None):
-        """vector: bf16 (K,) — the activation; replicated F times internally.
-        Returns the (M,) real output rows (K=6144 zero rows dropped)."""
+        """vector: bf16 (K,) — the activation; quantized and packed into
+        F slots internally. Returns the (M,) real output (K=6144 chunk
+        partials summed)."""
         if packed_weights is not None:
             self.write_buffer("packed_weights", packed_weights)
         self.write_buffer("vector", self.replicate_vector(vector))

@@ -14,90 +14,84 @@ from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 
 """
-UNIVERSAL fused INT4-dequant GEMV (M3b), layout v3 = COMPACT BLOCKS
-(P10): one PDI for every projection shape, and no K-padding DDR waste.
-The kernel reads K from the self-describing block tail at runtime and
-packs 6144/K tight tiles per block (K=2048 -> 3, K=6144 -> 1), so the
-device side (workers, fifos, placement) is IDENTICAL for all shapes and
-only the ctrl-code differs per (M, K) — run-w4layer showed every CU
-switch costs ~650us of PDI reload; with all ops on one CU the whole
-decode projection stream runs at single-CU speed. v2 padded every tile
-to one 13840 B slot (3x waste at K=2048 — P9's biggest gap item); v3
-streams only live bytes.
+UNIVERSAL fused INT4-dequant GEMV (M3b), layout v4 = MATRIX-UNIT TILES
+(P11): ONE PDI for every projection shape, and the inner loop on the
+aie2p matrix unit (mac_4x16_16x16 = 1024 MACs/instr; the v3 fp loop was
+ISSUE-bound at ~10 vector ops per 32 MACs — the P11 probe measured the
+matrix unit at ~100 GMAC/s/core, 32x). Every block is UNIFORM: 16 rows
+x 2048 k, ONE kernel call each; K=6144 ops stream 3 chunk-blocks per
+tile in chunk-major order (both blocks a B slot serves share one x
+chunk), so the device side is shape-free and only ctrl code differs.
 
 Fixed device geometry (must match across variants byte-for-byte so the
 compiled PDI is bit-identical):
-  - 8 columns, m_input=4 rows per tile/kernel call
-  - A fifo element = ELEM = 13888 bytes = ONE compact block: n = 6144/K
-    tiles, each padded to a 16-byte stride (the int4 load_v stream cannot
-    start misaligned — fingerprinted on hardware, P10), + the K header. acquire(1) per block keeps
-    the kernel's single-pointer contract (multi-element acquires are NOT
-    an option here: the placer does not allocate a fifo's elements
-    contiguously, and the dynamic-objFifo lowering of acquire(n>1) fails
-    to link with `undefined symbol: A_L3L1_0_cons_buff_1` on this flow).
-    Depth 2 = double-buffered blocks.
-  - The core calls the kernel CALLS_PER_BLOCK = 3 times per block with
-    tile_idx = 0,1,2; the kernel writes ZERO rows for tile_idx >= n so
-    the C fifo element count is K-independent (static loop bounds only —
-    the device side stays shape-free). K=6144 drains 3M C rows, 2/3 of
-    them zeros in 12-row groups (real rows first); K=2048 is dense.
-  - B fifo element = K_MAX*2 = 12288 B (K=2048 activations zero-pad the
-    slot); depth 2. One B slot serves BLOCKS_PER_B = 2 blocks, so the
-    DDR vector buffer holds F = blocks/2 copies of x back to back (host
-    replicates it) — still a single large BD with a positive stride
-    (per-element fills would need F shim BDs and the allocator caps a
-    channel at 16).
-  - C fifo element = m_input bf16 = 8 B; depth 2.
+  - 8 columns, m_input=16 rows per tile/kernel call
+  - A fifo element = ELEM = 18560 bytes = ONE 16x2048 tile (64-byte
+    aligned nibbles, transposed scales, K header at ELEM-8). acquire(1)
+    per block keeps the kernel's single-pointer contract (multi-element
+    acquires are NOT an option: the placer does not allocate a fifo's
+    elements contiguously, and the dynamic-objFifo lowering of
+    acquire(n>1) fails to link with `undefined symbol:
+    A_L3L1_0_cons_buff_1` on this flow). Depth 2 = double-buffered.
+  - B fifo element = B_SLOT = 6528 bytes uint8: x int8 (K_MAX wide,
+    live chunk at 0..2048) + per-group bf16 x scales d at K_MAX. One B
+    slot serves BLOCKS_PER_B = 2 blocks, so the DDR vector buffer holds
+    F = blocks/2 slots (host packs the chunk per slot) — a single large
+    BD with a positive stride (per-element fills would need F shim BDs
+    and the allocator caps a channel at 16).
+  - C fifo element = m_input bf16 = 32 B; depth 2. Every C row is live
+    (K=6144 rows are chunk partials the host sums — no v3 zero rows).
 
 Variant parameters (ctrl-code only): M (padded rows) and K (2048 or
-6144) -> DDR block layout and tap sizes. ABI: K=2048 needs M % 192 == 0
-(tiles pack 3/block and blocks are even), K=6144 needs M % 64 == 0.
+6144) -> DDR block layout and tap sizes. ABI: M % 256 == 0 for every K
+(16-row tiles / 8 cols, blocks paired two per B slot, and K=6144 needs
+even tiles per chunk — the same bound).
 """
 
-ELEM = 13888         # A fifo element bytes = one compact block
+ELEM = 18560         # A fifo element = one 16-row x 2048 tile (%64 == 0:
+                     # element buffers sit at base/base+ELEM; aie2p load_v
+                     # needs 64B alignment for 1024-bit vectors)
 K_MAX = 6144
-M_INPUT = 4
-CALLS_PER_BLOCK = 3  # static kernel calls per block (kernel skips i >= n)
+M_INPUT = 16
+TILE_K = 2048
+B_SLOT = K_MAX + 192 * 2  # 6528: x int8 (K_MAX) + d bf16[192]
 BLOCKS_PER_B = 2     # blocks served per B slot (keeps fills single-BD)
 
 
-def tiles_per_block(k):
-    return K_MAX // k
+def chunks_per_tile(k):
+    return k // TILE_K  # 1 (K=2048) or 3 (K=6144)
 
 
 def my_w4gemvu(dev, cols, M, K, group_size=32):
     assert cols == 8, "universal design is laid out for 8 columns"
     assert K in (2048, 6144), "K must be 2048 or 6144"
     assert group_size == 32
-    n = tiles_per_block(K)
-    tiles_per_col = M // cols // M_INPUT
-    assert tiles_per_col % n == 0, \
-        f"K={K}: tiles must pack {n} per block (M % {cols*M_INPUT*n} == 0)"
-    blocks_per_col = tiles_per_col // n
+    chunks = chunks_per_tile(K)
+    blocks_per_col = (M // cols // M_INPUT) * chunks
     assert blocks_per_col % BLOCKS_PER_B == 0, \
         "blocks per column must be even (B slot serves two blocks)"
 
     dtype_in = np.dtype[np.uint8]
-    dtype_vec = np.dtype[bfloat16]
+    dtype_vec = np.dtype[np.uint8]
     dtype_out = np.dtype[bfloat16]
 
     dev_ty = NPU1() if dev == "npu" else NPU2()
 
-    # Per-column DDR sizes (compact blocks stream only live bytes).
+    # Per-column DDR sizes (uniform blocks stream only live bytes).
     bytes_per_col = blocks_per_col * ELEM
     packed_total_bytes = cols * bytes_per_col
 
-    # K=6144 blocks hold one tile but the core still emits 3 C elements
-    # per block (2 zero) — the drain covers all produced rows.
-    c_rows = M * CALLS_PER_BLOCK // n
+    # Every block emits one live 16-row element; K=6144 rows are chunk
+    # partials in chunk-major M-row sections (host sums them).
+    c_rows = M * chunks
 
     # L1 types — the fixed geometry shared by every variant.
     L1_A_ty = np.ndarray[(ELEM,), dtype_in]
-    L1_B_ty = np.ndarray[(K_MAX,), dtype_vec]
+    L1_B_ty = np.ndarray[(B_SLOT,), dtype_vec]
     L1_C_ty = np.ndarray[(M_INPUT,), dtype_out]
 
     # L3 (DDR) types
-    b_elems = (blocks_per_col // BLOCKS_PER_B) * K_MAX
+    b_elems = (blocks_per_col // BLOCKS_PER_B) * B_SLOT
     L3_A_ty = np.ndarray[(packed_total_bytes,), dtype_in]
     L3_B_ty = np.ndarray[(b_elems,), dtype_vec]
     L3_C_ty = np.ndarray[(c_rows,), dtype_out]
@@ -108,10 +102,10 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
         [
             np.int32,   # m (rows per tile, compiled-in: M_INPUT)
             L1_A_ty,    # self-describing block
-            L1_B_ty,    # activation (first K*2 bytes valid)
+            L1_B_ty,    # x int8 + d scales (chunk at 0..2048, d at K_MAX)
             L1_C_ty,
             np.int32,   # group_size
-            np.int32,   # tile_idx (0..2; >= n writes zero rows)
+            np.int32,   # tile_idx (vestigial v3 ABI slot; always 0)
         ],
     )
 
@@ -139,11 +133,9 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
             b = B_L3L1_fifo.acquire(1)
             for _blk in range_(BLOCKS_PER_B):
                 a = A_L3L1_fifo.acquire(1)
-                for t_idx in range_(CALLS_PER_BLOCK):
-                    t_i32 = index.casts(T.i32(), t_idx)
-                    c = C_L1L3_fifo.acquire(1)
-                    fused_matvec_fn(M_INPUT, a, b, c, 32, t_i32)
-                    C_L1L3_fifo.release(1)
+                c = C_L1L3_fifo.acquire(1)
+                fused_matvec_fn(M_INPUT, a, b, c, 32, 0)
+                C_L1L3_fifo.release(1)
                 A_L3L1_fifo.release(1)
             B_L3L1_fifo.release(1)
 
@@ -194,12 +186,12 @@ def my_w4gemvu(dev, cols, M, K, group_size=32):
         tg = rt.task_group()
         for i in range(cols):
             rt.fill(A_L3L1_fifos[i].prod(), A, A_taps[i], task_group=tg)
-            # One multi-element B fill per column: the vector buffer holds
-            # F copies of the activation, so the stream shape mirrors the
-            # proven A fill (one big BD, positive stride). Untapped
-            # per-element fills would need F shim BDs per channel and the
-            # allocator caps a channel at 16; a stride-0 repeat tap is
-            # rejected by NPU BDs.
+            # One multi-element B fill per column: the vector buffer
+            # holds F slots of the packed (x, d) activation, so the
+            # stream shape mirrors the proven A fill (one big BD,
+            # positive stride). Untapped per-element fills would need F
+            # shim BDs per channel and the allocator caps a channel at
+            # 16; a stride-0 repeat tap is rejected by NPU BDs.
             rt.fill(B_L3L1_fifos[i].prod(), B, B_taps[i], task_group=tg)
         for i in range(cols):
             rt.drain(
