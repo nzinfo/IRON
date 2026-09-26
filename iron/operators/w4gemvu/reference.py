@@ -2,24 +2,24 @@
 
 """Reference for the universal (self-describing-block) w4gemvu operator.
 
-Layout v4 = MATRIX-UNIT TILES (P11). The v3 A/B proved the fp inner loop
-is ISSUE-bound (~10 vector ops per 32 MACs) while the aie2p matrix unit
-does mac_4x16_16x16 = 1024 MACs/instr (~100 GMAC/s/core measured, 32x).
-v4 reformulates the GEMV as mmul<4,16,16,int8,int4>:
+Layout v5 = v4 matrix-unit tiles (P11) with the B STREAM REMOVED (P12:
+dedicated B channels + F-slot fills cost ~30% of the weight stream; 8
+channels already reach the ~55 GB/s device wall). The activation rides
+the A fifo as a K=0 element:
 
   y[n] = sum_g sf[n][g] * d[g] * (int32 dot of W[n][g,*] x[g,*])
 
 Weight quantization keeps the signed-int4 ABI (per-group-32 symmetric,
-scale = amax/7 bf16). NEW: the activation is quantized int8 per-group-32
-(scale = amax/127 bf16) so the inner product is an EXACT int32 dot —
-this is a numerics ABI change vs v2/v3 (goldens bake it in).
+scale = amax/7 bf16); the activation is quantized int8 per-group-32
+(scale = amax/127 bf16) so the inner product is an EXACT int32 dot.
 
 Blocks are UNIFORM: one fifo element = 18560 B = ONE 16-row x 2048-k
 tile. K=6144 ops stream 3 chunk-blocks per tile in CHUNK-MAJOR order
-(chunk c's tiles consecutively) so each B slot's two blocks share one x
-chunk. Every kernel call computes a 16-row partial; the host sums the
-3 chunk partials for K=6144 (no more interleaved zero rows — every C
-row is live).
+(the export layout, kept); blocks are self-describing via the chunk id
+word, so the order is no longer load-bearing. Every kernel call
+computes a 16-row partial; the host sums the 3 chunk partials for
+K=6144. Each column's C carries one leading ZERO 16-row element from
+the activation element (the host skips it).
 
 Block layout (see w4gemvu.cc):
   [0 .. 16384)   nibbles, group-major: group g = 256 nibbles k-major,
@@ -27,14 +27,18 @@ Block layout (see w4gemvu.cc):
                  order of mac_4x16_16x16 (a byte packs rows n, n+1).
   [16384 .. 18432) sf_t: bf16[64][16], row n's group-g scale at g*16+n
                  (transposed vs v3: one 32B load feeds the scale step).
-  [18552 .. 18556) 2048 as u32 (the TILE K — always 2048, even for
-                 K=6144 ops; guard only)
+  [18552 .. 18556) K as u32: 2048 = weight block, 0 = activation
+                 element, else stale -> zero rows.
+  [18556 .. 18560) chunk as u32: which 2048-wide x slice this block
+                 consumes (0 for K=2048 ops).
 
-B slot (6528 B uniform): [0..6144) x int8 (live chunk at 0..2048),
-[6144..6528) d bf16 per-group x scales (live chunk's 64 at 6144).
+Activation element (ELEM B): [0..6144) x int8 ALL chunks (chunk c at
+c*2048), [6144..6528) d bf16[192] all chunks, [18552..18556) K = 0.
+ONE per op, shared by every column's X fill — the per-token host cost
+is a single ELEM write (no F-slot replication).
 
-ABI: M % 256 == 0 for every K (16-row tiles x 8 cols, and blocks pair
-two-per-B-slot; K=6144 also needs even tiles per chunk — same bound).
+ABI: M % 256 == 0 for every K (16-row tiles x 8 cols; K=6144 needs
+even tiles per chunk for the chunk-major sections — same bound).
 """
 
 import numpy as np
@@ -49,9 +53,7 @@ ELEM = 18560         # A fifo element = one 16-row x 2048 tile. %64 == 0 is
 K_MAX = 6144
 TILE_K = 2048        # k per block (K=6144 ops stream 3 blocks per tile)
 TILE_ROWS = 16
-B_SLOT = K_MAX + 192 * 2  # x int8 (K_MAX) + d bf16[192] = 6528
-BLOCKS_PER_B = 2     # blocks served per B slot (single-BD fills)
-D_BYTES = (TILE_K // 32) * 2  # live d bytes per slot (64 bf16 scales)
+D_BYTES_ALL = (K_MAX // 32) * 2  # all-chunk d bytes in the x element (384)
 
 
 def chunks_per_tile(k):
@@ -65,7 +67,8 @@ def tiles_per_chunk(M, cols=8):
 
 def blocks_per_col(M, K, m_input=TILE_ROWS, cols=8):
     """Fifo blocks one column streams (chunk-major: chunk c's tiles
-    consecutive, so the two blocks a B slot serves share one x chunk)."""
+    consecutive — the export layout; blocks are self-describing via the
+    chunk word so the order is conventional, not load-bearing)."""
     return tiles_per_chunk(M, cols) * chunks_per_tile(K)
 
 
@@ -102,8 +105,6 @@ def quantize_and_pack(W, group_size=32, m_input=TILE_ROWS, cols=8):
     assert M % cols == 0 and (M // cols) % m_input == 0
     chunks = chunks_per_tile(K)
     T = tiles_per_chunk(M, cols)
-    assert T % 2 == 0, "tiles per chunk must be even (B slot serves two blocks)"
-    assert (T * chunks) % BLOCKS_PER_B == 0
 
     num_groups_per_row = K // group_size
     groups_per_chunk = TILE_K // group_size  # 64
@@ -130,9 +131,11 @@ def quantize_and_pack(W, group_size=32, m_input=TILE_ROWS, cols=8):
     for col in range(cols):
         base_rows = col * rows_per_col
         for c in range(chunks):
+            c_le = struct.pack("<I", c)
             for t in range(T):
                 off = (col * blocks + c * T + t) * ELEM
                 packed[off + ELEM - 8 : off + ELEM - 4] = np.frombuffer(k_le, dtype=np.uint8)
+                packed[off + ELEM - 4 : off + ELEM] = np.frombuffer(c_le, dtype=np.uint8)
                 r0 = base_rows + t * m_input
                 # Nibbles: group g's 256 elements k-major [k][n] — byte
                 # j of the group packs rows 2j (low) and 2j+1 (high) at
@@ -156,64 +159,65 @@ def quantize_and_pack(W, group_size=32, m_input=TILE_ROWS, cols=8):
     return packed, W_dequant
 
 
+def c_section_rows(M, K, m_input=TILE_ROWS, cols=8):
+    """bf16 ROWS per column's C section: one zero element (the
+    activation's) + the block partials + one pad element. Sections are
+    sized in whole 16-row elements and must be an EVEN element count
+    (BD transfers and offsets are 4-byte aligned and 1+blocks is always
+    odd); the pad element is never transferred or read."""
+    return (blocks_per_col(M, K, m_input, cols) + 2) * m_input
+
+
 def output_rows(M, K):
-    """Rows the C drain writes: one 16-row partial per block (all live)."""
-    return M * chunks_per_tile(K)  # M (K=2048) / 3M (K=6144)
+    """bf16 rows the C drain tensor holds: per column one zero 16-row
+    element from the activation, the block partials, and one pad
+    element."""
+    return 8 * c_section_rows(M, K)  # cols is always 8 in the universal design
 
 
 def unshuffle_output(c_rows, M, K, cols=8):
-    """Device C rows -> real (M,) output (K=6144 sums the 3 chunk
-    partials; each column's C is chunk-major sections of its own
-    rows_per_col rows)."""
-    if K == 2048:
-        return c_rows[:M].clone()
+    """Device C rows -> real (M,) output. v5: each column's section
+    starts with the activation element's 16 zero rows (skip) and ends
+    with a pad element, holding its chunk-major partials in between
+    (K=6144 sums the 3 chunk partials)."""
     chunks = chunks_per_tile(K)
     rows_per_col = M // cols
-    raw = c_rows.reshape(cols, chunks, rows_per_col)
-    # partials[c, col-block] then sum over c
-    out = raw[:, 0, :].reshape(M).clone()
-    for c in range(1, chunks):
-        out += raw[:, c, :].reshape(M)
-    return out
+    section = c_section_rows(M, K)
+    raw = c_rows.reshape(cols, section)
+    live = raw[:, TILE_ROWS : TILE_ROWS + chunks * rows_per_col]
+    if chunks == 1:
+        return live.reshape(M).clone()
+    return live.reshape(cols, chunks, rows_per_col).sum(dim=1).reshape(M)
 
 
 def shuffle_output(partials, M, K, cols=8):
     """Per-chunk (chunks, M) bf16 partials -> the device C-row layout:
-    column col holds its chunks sections back to back (the drain
-    streams each column's production order, which is chunk-major).
-    The v4 raw buffer is NOT reconstructable from the final output
-    alone — the golden carries per-chunk partials."""
+    column col's section = [16 zero rows (activation) | chunk-major
+    partial sections | pad element]."""
     chunks = chunks_per_tile(K)
     assert partials.shape == (chunks, M)
-    if chunks == 1:
-        return partials[0].clone()
     rows_per_col = M // cols
-    raw = torch.empty(chunks * M, dtype=partials.dtype)
+    section = c_section_rows(M, K)
+    raw = torch.zeros(cols * section, dtype=partials.dtype)
     for col in range(cols):
+        base = col * section + TILE_ROWS  # skip the x zeros
         for c in range(chunks):
-            raw[col * chunks * rows_per_col + c * rows_per_col :
-                col * chunks * rows_per_col + (c + 1) * rows_per_col] = \
+            raw[base + c * rows_per_col : base + (c + 1) * rows_per_col] = \
                 partials[c, col * rows_per_col : (col + 1) * rows_per_col]
     return raw
 
 
-def replicate_quantized(q, d, blocks, T, chunks):
-    """(q int8 (K,), d bf16 (K//32,)) -> the F-slot DDR vector buffer
-    (uint8, F * B_SLOT): slot j serves blocks 2j, 2j+1 = chunk
-    (2j)//T's tiles, so it carries that chunk's x at 0..2048 and its 64
-    d scales at 6144."""
-    reps = blocks // BLOCKS_PER_B
-    vb = np.zeros(reps * B_SLOT, dtype=np.uint8)
-    q_np = q.numpy()
-    d_np = d.view(torch.uint16).numpy()
-    for r in range(reps):
-        c = (2 * r) // T
-        base = r * B_SLOT
-        vb[base : base + TILE_K] = q_np[c * TILE_K : (c + 1) * TILE_K]
-        vb[base + K_MAX : base + K_MAX + D_BYTES] = d_np[
-            c * (TILE_K // 32) : (c + 1) * (TILE_K // 32)
-        ].view(np.uint8)
-    return torch.from_numpy(vb)
+def build_activation_element(q, d, K):
+    """(q int8 (K,), d bf16 (K//32,)) -> the ONE ELEM-sized activation
+    element all columns share: x all chunks at 0..K, d all chunks at
+    K_MAX, K header 0 at ELEM-8."""
+    import struct
+
+    xb = np.zeros(ELEM, dtype=np.uint8)
+    xb[0:K] = q.numpy().view(np.uint8)
+    xb[K_MAX : K_MAX + (K // 32) * 2] = d.view(torch.uint16).numpy().view(np.uint8)
+    xb[ELEM - 8 : ELEM - 4] = np.frombuffer(struct.pack("<I", 0), dtype=np.uint8)
+    return torch.from_numpy(xb)
 
 
 def generate_golden_reference(M, K, group_size=32, m_input=TILE_ROWS, cols=8, seed=42):
@@ -244,6 +248,7 @@ def generate_golden_reference(M, K, group_size=32, m_input=TILE_ROWS, cols=8, se
     return {
         "packed_weights": packed,
         "x": x,
+        "activation": build_activation_element(q, d, K),
         "output": out,
         "output_raw": shuffle_output(partials, M, K),
     }

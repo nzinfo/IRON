@@ -46,8 +46,8 @@ def test_w4gemvu(M, K, aie_context):
 
     input_buffers = {
         "packed_weights": torch.from_numpy(golden_ref["packed_weights"]),
-        # The vector buffer holds F packed (x int8, d) slots (one per B
-        # fifo element) — a bare (K,) tensor would leave slots 2..F stale.
+        # v5: the vector buffer is ONE ELEM-sized activation element
+        # (x + d all chunks, K header 0) shared by every column's fill.
         "vector": operator.replicate_vector(golden_ref["x"]),
     }
     # The device buffer carries every produced C row; K=6144 rows are
