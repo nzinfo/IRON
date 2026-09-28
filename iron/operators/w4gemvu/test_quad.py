@@ -257,7 +257,8 @@ def test_w4gemvu_quad(M1, K1, M2, M3, K3, M4, aie_context):
     # the C BO's host-written region (residual1 + the four windows' header
     # words) must ride in input_buffers (P16 lesson).
     input_buffers = {
-        # X element rides the head of packed1 (5-BO ctrl-kernel cap).
+        # X elements front-grouped at the packed1 head (P21-2; still no
+        # 6th BO — 5-BO ctrl-kernel cap).
         "packed1": operator.build_packed1(
             torch.from_numpy(golden["packed1"]), golden["activation"]
         ),

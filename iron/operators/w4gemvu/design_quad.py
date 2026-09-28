@@ -102,11 +102,21 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
 
     dev_ty = NPU1() if dev == "npu" else NPU2()
 
-    bytes1_per_col = (1 + blocks_o) * ELEM  # X (K=0) element first — the
-    # P12 pattern: the activation rides the A fifo as the stream head, so
-    # the op needs NO separate X BO (the NPU ctrl kernel signature is
-    # capped at 5 buffer args by aiecc's emit_design_kernel_json — a 6th
-    # BO segfaults the host at run.set_arg, first quad board run).
+    # P21-2: packed1 is FRONT-GROUPED — [X0..X7 | blocks_col0..col7] —
+    # not the P12 per-column [X | blocks] stream. The activation still
+    # rides packed1 (no 6th BO: the ctrl kernel signature is capped at 5
+    # buffer args by aiecc's emit_design_kernel_json), but the 8 X
+    # elements sit CONTIGUOUSLY at the BO head so the host's per-exec
+    # dirty set is one 148KB run: 1 SYNC_BO + ~10us instead of flushing
+    # the whole 2.5MB weight BO behind 8 strided heads (P21-1 measured
+    # both whole-BO and 8-region syncs at 129-154us/layer). Each column
+    # therefore takes TWO fills in tg1 (its X element, then its blocks —
+    # the same 2-fill-per-column shape tg2 already proves). Kernel-side
+    # nothing changes: elements self-describe via tail headers, so the
+    # per-column fifo stream is still [X | 16 blocks].
+    bytes1_per_col = (1 + blocks_o) * ELEM  # total per column, layout above
+    x_region = cols * ELEM  # front: X0..X7 contiguous
+    blocks1_off = lambda col: x_region + col * blocks_o * ELEM
     bytes2_per_col = (1 + blocks_gu) * ELEM  # K=3 w element first
     bytes3_per_col = blocks_dn * ELEM  # no X, no head — pure blocks
     bytes4_per_col = (1 + blocks_q) * ELEM  # K=3 w element first
@@ -169,11 +179,23 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
         for i in range(cols)
     ]
 
-    A1_taps = [
+    # P21-2: per column the X element (front region) and the o blocks
+    # (behind the whole X region) are two fills — stream order per fifo
+    # stays [X | 16 blocks].
+    A1x_taps = [
         TensorAccessPattern(
             tensor_dims=(1, packed1_total),
-            offset=col * bytes1_per_col,
-            sizes=[1, 1, 1, bytes1_per_col],
+            offset=col * ELEM,
+            sizes=[1, 1, 1, ELEM],
+            strides=[0, 0, 0, 1],
+        )
+        for col in range(cols)
+    ]
+    A1b_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, packed1_total),
+            offset=blocks1_off(col),
+            sizes=[1, 1, 1, blocks_o * ELEM],
             strides=[0, 0, 0, 1],
         )
         for col in range(cols)
@@ -330,10 +352,12 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
         C,
     ):
         rt.start(*workers)
-        # tg1: o ([X element | 16 blocks] as one stream) -> C1
+        # tg1: o (P21-2: per column [X fill | blocks fill] from the
+        # front-grouped packed1 — tg2's 2-fill-per-column loop shape) -> C1
         tg1 = rt.task_group()
         for i in range(cols):
-            rt.fill(A_fifos[i].prod(), A1, A1_taps[i], task_group=tg1)
+            rt.fill(A_fifos[i].prod(), A1, A1x_taps[i], task_group=tg1)
+            rt.fill(A_fifos[i].prod(), A1, A1b_taps[i], task_group=tg1)
         for i in range(cols):
             rt.drain(C_fifos[i].cons(), C, C1_taps[i], task_group=tg1, wait=True)
         rt.finish_task_group(tg1)

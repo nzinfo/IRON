@@ -33,8 +33,9 @@ class AIEW4GEMVUQuad(AIEOperatorBase):
     host-owned padA/padB gap rows); residual2 = x + o_out is computed on
     device by a tg4 re-read of the win1 window (quad flag dispatch), so
     the host writes ONLY residual1 per token. rt.sequence order:
-    A1, A2, A3, A4, C (the X activation element rides the head of
-    packed1 — the NPU ctrl kernel signature caps at 5 buffer args).
+    A1, A2, A3, A4, C (the X activation elements ride packed1
+    FRONT-GROUPED at the BO head — P21-2 — still no 6th BO: the NPU
+    ctrl kernel signature caps at 5 buffer args).
     """
 
     def __init__(
@@ -154,17 +155,22 @@ class AIEW4GEMVUQuad(AIEOperatorBase):
         )
 
     def build_packed1(self, packed_blocks, activation_elem):
-        """Per column [X element | that column's 16 o blocks] — the P12
-        pattern (activation rides the A stream head), so the op needs no
-        separate vector BO (5-BO ctrl-kernel cap)."""
+        """P21-2 FRONT-GROUPED: [X0..X7 | blocks_col0..col7]. The
+        activation still rides packed1 (no separate vector BO — the
+        5-BO ctrl-kernel cap), but the 8 X elements are contiguous at
+        the head so the host's per-exec dirty set is one 148KB run
+        (P21: whole-BO and 8-region syncs both measured 129-154us/layer
+        against this layout's ~25us). Per-column fifo stream is still
+        [X | 16 blocks] — two fills per column in tg1 (tg2's shape)."""
         blocks = len(packed_blocks) // (self.num_aie_columns * ELEM)
         assert blocks == self.blocks1
-        bytes_per_col = (1 + blocks) * ELEM
-        out = np.zeros(self.num_aie_columns * bytes_per_col, dtype=np.uint8)
+        x_region = self.num_aie_columns * ELEM
+        out = np.zeros(x_region + self.num_aie_columns * blocks * ELEM, dtype=np.uint8)
         for col in range(self.num_aie_columns):
-            base = col * bytes_per_col
-            out[base : base + ELEM] = activation_elem.numpy()
-            out[base + ELEM : base + bytes_per_col] = packed_blocks[
+            out[col * ELEM : (col + 1) * ELEM] = activation_elem.numpy()
+            out[
+                x_region + col * blocks * ELEM : x_region + (col + 1) * blocks * ELEM
+            ] = packed_blocks[
                 col * blocks * ELEM : (col + 1) * blocks * ELEM
             ]
         return torch.from_numpy(out)
