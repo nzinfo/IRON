@@ -1,0 +1,833 @@
+// SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#define NOCPP
+
+#include "../aie_kernel_utils.h"
+
+#include <aie_api/aie.hpp>
+#include <stdint.h>
+
+// P28 layer-v2: the WHOLE transformer layer rides ONE task group per
+// worker, persistent-worker style (P28-1 model, P28-3 ring proof). Eight
+// workers on tiles (0,2..5)+(1,2..5) form a serpentine ring; each worker
+// owns a 256-row j-slice of every projection and the three all-gathers
+// (o-out, swiglu, down-out) traverse core<->core ObjectFifos instead of
+// the C->DDR->window round trips that made the task group the atom of
+// scheduling cost (P27-4: 129 groups x ~75us = the entire device-side
+// gap to FLM; groups can only be REMOVED by designing away cross-group
+// dependencies).
+//
+// Per exec per worker the A fifo delivers (in this exact order):
+//   K=0    X element: [0,2048) attn int8 q (host-quantized g32),
+//          [6144,6400) d bf16[64], [6400,6404) worker id u32,
+//          K header @18552. Stages the replicated A-ops + d and resets
+//          ALL per-exec state (the persistent worker's exec boundary).
+//   K=100  xn element: [0,512) x_n chunk bf16 (256 = this worker's slice
+//          of the residual) -> lv_xn.
+//   K=2048 x16 o blocks (phase O): partials -> lv_o.
+//   ---- ring 1 (r13 fifo, 512B elements): fr1/fw1/st1 gather x' ----
+//   K=101  w2 element: [0,4096) ln2 weight bf16. rms(x' full) -> quantize
+//          -> replicated arena + lv_dA; resets gate/up counters.
+//   K=103  x48 gate blocks -> lv_gate (768 bf16).
+//   K=104  x48 up blocks -> lv_upwin (2-block window); every 2nd block
+//          runs one swiglu group k (sig -> amax -> quant) with global
+//          group g = p*24 + k: q int8 -> lv_sw[g*32], scale ->
+//          lv_sw[6144 + 2g].
+//   ---- ring 2 (r2 fifo, 832B elements): fr2/fw2/st2 gather sw ----
+//   K=105  x48 down chunk-blocks (c-major: c outer 0..2, b inner 0..15;
+//          chunk word @18556 selects the sw slice). Arena rebuilt from
+//          lv_sw[2048c..] only when c changes (3 rebuilds, not 48).
+//          Each partial (bf16-rounded) accumulates f32 into dacc.
+//   ---- ring 3 (REUSES the r13 fifo): fr3/st3 gather xn1 (fr3
+//   recomputes x' from lv_xn+lv_o — see the lv_shared overlay note) ----
+//   K=102  w1 element: rms(xn1 full) -> quantize -> arena + lv_dA;
+//          phase = QKV.
+//   K=2048 x24 qkv blocks (phase QKV) -> REAL C elements.
+//   lv_cxn x16: drain this worker's xn1 chunk (256 bf16) as C elements
+//          (the next layer's residual, host-refilled as the next exec's
+//          K=100/xn and used for host attention).
+//
+// Only the qkv (24) and cxn (16) calls touch the C fifo — 40 C elements
+// = 1280 B per worker per exec. Everything else stays in L1/.bss, which
+// is why TWO extern "C" entries exist: MLIR cannot pass a null memref,
+// so the no-C flavors go through the 4-arg w4gemvu_layer_a and only the
+// qkv flavor uses the 5-arg w4gemvu_layer_bf16 (the mha design's 8
+// kernels sharing one bin_name is the proven multi-Kernel pattern; the
+// Worker collects bin_names in a set so the single .o links once).
+//
+// Ring position arithmetic: the serpentine ring visits workers in the
+// order 0,1,2,3,7,6,5,4 (SUCC = {0:1,1:2,2:3,3:7,7:6,6:5,5:4,4:0}), so
+// worker w sits at ring position p = (w < 4) ? w : 11 - w. In round r
+// (r = 1..7) a worker receives the chunk that started at ring position
+// (p - r) & 7 — stored to slot (p - r) & 7 of the gather buffer, and
+// forwarded on rounds 1..6 only (round 7's chunk would return to its
+// origin). Worker w's global j-slices are defined by p, never by w.
+//
+// NUMERICS: every rounding step mirrors the v5/fused golden chain
+// (P17/P19): x' = bf16(f32(x_n) + f32(o)) [fr1]; rms in f32 over the
+// bf16 residual with inv = fused_rsqrt(sumsq/2048 + 1e-5), xn NOT
+// rounded to bf16 before quantize; amax = integer max of (bits &
+// 0x7fffffff); d = bf16(amax/127); q = magic-add RNE then clip +-127;
+// sigmoid via hw exp2<bfloat16> (P19d measured ~2e-4 actual
+// differential, tanh fallback not needed); sw rounded to bf16 before
+// quantize; down partials bf16-rounded then f32-accumulated in c order;
+// xn1 = bf16(f32(x') + dacc) [fr3].
+//
+// STACK LAW (P16/P17): the peano linker's single paddxm covers the
+// WHOLE call chain; the deepest path here is entry -> lv_body ->
+// flavor -> lv_compute (the proven 0x340 hot shape) — keep flavors
+// lean and re-check the ELF frame after any structural change.
+// PMEM: 16 KB incl. 3052 B glue (P19b law); all scalar loops stay
+// ROLLED (#pragma clang loop unroll(disable)).
+
+constexpr uint32_t kBlockBytes = 18560; // A fifo element (v4/v5 ABI)
+constexpr uint32_t kKMax = 6144;
+constexpr uint32_t kTileRows = 16;
+constexpr uint32_t kTileK = 2048;
+constexpr uint32_t kGroups = kTileK / 32; // 64
+constexpr uint32_t kM1 = 2048;            // model hidden width
+constexpr uint32_t kRowsPerWorker = kM1 / 8;   // 256
+constexpr uint32_t kJPerWorker = 6144 / 8;     // 768 gate/up rows
+constexpr uint32_t kGrpPerWorker = kJPerWorker / 32; // 24
+
+// ---- .bss state block (per worker; 21184 B, arrays as raw bytes to
+// keep bfloat16 ctors out of the AIE's ctor-less startup) ----
+static uint8_t lv_arena[kGroups * 128] __attribute__((aligned(64))); // 8192: replicated A-ops
+static uint8_t lv_sw[6144 + 384] __attribute__((aligned(64)));       // 6528: int8 q global-j + scales @6144
+static uint8_t lv_xn[kRowsPerWorker * 2] __attribute__((aligned(64))); // 512: 256 bf16
+static uint8_t lv_o[kRowsPerWorker * 2] __attribute__((aligned(64))); // 512: 256 bf16
+static float lv_dacc[kRowsPerWorker] __attribute__((aligned(64)));     // 1024: f32 down partials
+static uint8_t lv_shared[kM1 * 2] __attribute__((aligned(64)));        // 4096: 8 x 512B ring slots
+static uint8_t lv_dA[kGroups * 2] __attribute__((aligned(64)));        // 128: 64 bf16
+static uint8_t lv_temp[128] __attribute__((aligned(64)));              // per-group f32 staging
+static uint8_t lv_qscratch[128] __attribute__((aligned(64)));          // quant div lanes (PMEM law)
+static uint32_t lv_ctr[16] __attribute__((aligned(64)));
+
+// Phase-overlaid windows INSIDE lv_shared (L1 law). After K=101's rms
+// consumes the gathered x', all 4096 B are dead until ring3 rewrites
+// the slots with xn1 — the gate window (1536 B), the up window (64 B)
+// and the dead c_out alias for the 4-arg entry live in that gap.
+// This is not optional: the ObjectFifo home rule (home tile = FIRST
+// worker in the design's workers list that references the fifo) means
+// one tile always carries BOTH its ring edges' depth-2 buffers for
+// BOTH rings — the worst tile is 37120 (A) + 2048 + 3328 (rings) +
+// 64 (C) + 21184 (.bss) + 1024 (stack) = 64768 < 65536. The touch
+// graph is a cycle on the workers, so no list ordering can spread the
+// double-home; reordering only moves it.
+#define lv_gate (lv_shared)
+#define lv_upwin (lv_shared + 1536)
+#define lv_dummy (lv_shared + 1600)
+
+// lv_ctr words
+constexpr uint32_t cO = 0;      // o block index (0..15)
+constexpr uint32_t cGate = 1;   // gate block index (0..47)
+constexpr uint32_t cUpG = 2;    // swiglu group index (0..23)
+constexpr uint32_t cUpH = 3;    // up window half (0/1)
+constexpr uint32_t cChunk = 4;  // last arena chunk built (255 = none)
+constexpr uint32_t cXnI = 5;    // cxn drain index (0..15)
+constexpr uint32_t cPhase = 6;  // 0 = O, 1 = QKV
+constexpr uint32_t cR1 = 7;     // ring1 rounds received
+constexpr uint32_t cR2 = 8;     // ring2 rounds received
+constexpr uint32_t cR3 = 9;     // ring3 rounds received
+constexpr uint32_t cW = 10;     // worker id
+constexpr uint32_t cDown = 11;  // down element index (0..47)
+constexpr uint32_t cP = 12;     // ring position
+
+// shared per-group helpers (P19 forms, cloned from w4gemvu.cc verbatim)
+static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp);
+static void __attribute__((noinline)) fused_sw_quant(uint32_t m_bits,
+                                                     float *__restrict temp,
+                                                     uint16_t *d_out);
+static void __attribute__((noinline)) fused_sw_x(const float *__restrict temp,
+                                                 uint8_t *__restrict dst);
+
+// Newton iterations ride the VECTOR unit (PMEM law, P28-4): peano has
+// no scalar FPU, so scalar f32 mul is a __mulsf3 soft call -- 3
+// iterations x 3 muls pulled the ~780B runtime (plus __muldi3) into
+// the 16KB program memory. Vector f32 mul/sub are correctly rounded,
+// so the chain stays bit-identical to the golden's np.float32 scalars.
+// lv_temp is dead here (the sumsq reduce already consumed it).
+static inline float fused_rsqrt(float s)
+{
+    union { float f; uint32_t u; } v = { s };
+    v.u = 0x5F3759DFu - (v.u >> 1);
+    const aie::vector<float, 32> sv = aie::broadcast<float, 32>(s);
+    const aie::vector<float, 32> two = aie::broadcast<float, 32>(2.0f);
+    aie::vector<float, 32> xv = aie::broadcast<float, 32>(v.f);
+    float *__restrict scr = reinterpret_cast<float *__restrict>(lv_temp);
+#pragma clang loop unroll(disable)
+    for (int i = 0; i < 3; i++) {
+        const aie::vector<float, 32> y =
+            aie::mul(xv, xv).to_vector<float>();
+        const aie::vector<float, 32> t =
+            aie::sub(two, aie::mul(sv, y).to_vector<float>());
+        xv = aie::mul(xv, t).to_vector<float>();
+    }
+    aie::store_v(scr, xv);
+    return scr[0];
+}
+
+static inline float fused_bf16_to_f32(uint16_t b)
+{
+    union { float f; uint32_t u; } v = { 0.0f };
+    v.u = (uint32_t)b << 16;
+    return v.f;
+}
+
+static inline uint16_t fused_f32_to_bf16(float f)
+{
+    union { float f; uint32_t u; } v = { f };
+    uint32_t rounded = v.u + 0x7FFFu + ((v.u >> 16) & 1u);
+    return (uint16_t)(rounded >> 16);
+}
+
+// ---- compute core: the v5.4 dual-accumulator hot loop, verbatim except
+// the A-operand/d pointers are parameters (lv_arena / lv_dA or the sw
+// tail) and c_out is the caller's destination.
+static void __attribute__((noinline)) lv_compute(const uint8_t *__restrict a_in,
+                                                 const int8_t *__restrict As,
+                                                 const bfloat16 *__restrict d,
+                                                 bfloat16 *__restrict c_out)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+
+    const int4 *__restrict nib = reinterpret_cast<const int4 *__restrict>(a_in);
+    const bfloat16 *__restrict sf_t =
+        reinterpret_cast<const bfloat16 *__restrict>(a_in + kTileRows * kTileK / 2);
+
+    aie::accum<accfloat, kTileRows> acc0 = aie::zeros<accfloat, kTileRows>();
+    aie::accum<accfloat, kTileRows> acc1 = aie::zeros<accfloat, kTileRows>();
+
+    for (uint32_t g = 0; g < kGroups; g += 2) {
+        aie::vector<int8, 64> A0 = aie::load_v<64>(As + g * 128);
+        aie::vector<int8, 64> A1 = aie::load_v<64>(As + g * 128 + 64);
+        aie::vector<int4, 256> B0 = aie::load_v<256>(nib + g * 256);
+        aie::vector<int4, 256> B1 = aie::load_v<256>(nib + g * 256 + 128);
+        aie::mmul<4, 16, 16, int8, int4> mm;
+        mm.mac(A0, B0);
+        mm.mac(A1, B1);
+        aie::vector<int32, 16> r0 = mm.to_vector<int32>().extract<16>(0);
+        aie::vector<float, 16> rf = aie::to_float<float>(r0);
+        aie::vector<bfloat16, 16> sfb = aie::load_v<16>(sf_t + g * kTileRows);
+        aie::vector<bfloat16, 16> db = aie::broadcast<bfloat16, 16>(d[g]);
+        aie::vector<float, 16> sfd = aie::mul(sfb, db).to_vector<float>();
+        acc0 = aie::mac(acc0, rf, sfd);
+
+        aie::vector<int8, 64> A2 = aie::load_v<64>(As + g * 128 + 128);
+        aie::vector<int8, 64> A3 = aie::load_v<64>(As + g * 128 + 192);
+        aie::vector<int4, 256> B2 = aie::load_v<256>(nib + g * 256 + 256);
+        aie::vector<int4, 256> B3 = aie::load_v<256>(nib + g * 256 + 384);
+        aie::mmul<4, 16, 16, int8, int4> mm1;
+        mm1.mac(A2, B2);
+        mm1.mac(A3, B3);
+        aie::vector<int32, 16> r1 = mm1.to_vector<int32>().extract<16>(0);
+        aie::vector<float, 16> rf1 = aie::to_float<float>(r1);
+        aie::vector<bfloat16, 16> sfb1 = aie::load_v<16>(sf_t + g * kTileRows + kTileRows);
+        aie::vector<bfloat16, 16> db1 = aie::broadcast<bfloat16, 16>(d[g + 1]);
+        aie::vector<float, 16> sfd1 = aie::mul(sfb1, db1).to_vector<float>();
+        acc1 = aie::mac(acc1, rf1, sfd1);
+    }
+    aie::vector<float, kTileRows> ones = aie::broadcast<float, kTileRows>(1.0f);
+    aie::accum<accfloat, kTileRows> acc =
+        aie::mac(acc0, ones, acc1.template to_vector<float>());
+    aie::vector<bfloat16, kTileRows> out = acc.template to_vector<bfloat16>();
+    aie::store_v(c_out, out);
+}
+
+// int8 q (64 groups x 32) -> replicated [4x16] A-ops in lv_arena.
+// The K=0 staging body (attn) and the K=105 chunk rebuild (sw) share it.
+static void __attribute__((noinline)) lv_build_arena(const int8_t *__restrict x8)
+{
+#pragma clang loop unroll(disable)
+    for (uint32_t g = 0; g < kGroups; g++) {
+        const int8_t *xg = x8 + g * 32;
+        aie::vector<int8, 16> x0 = aie::load_v<16>(xg);
+        aie::vector<int8, 16> x1 = aie::load_v<16>(xg + 16);
+        aie::vector<int8, 32> x0l = aie::concat(x0, x0);
+        aie::vector<int8, 32> x1l = aie::concat(x1, x1);
+        int8_t *dst = reinterpret_cast<int8_t *__restrict>(lv_arena) + g * 128;
+        aie::store_v(dst, aie::concat(x0l, x0l));
+        aie::store_v(dst + 64, aie::concat(x1l, x1l));
+    }
+}
+
+// one group's rms-weight pass: temp = (h2 * inv) * wgt in f32, UNROUNDED
+// (stage2b semantics — verified against the golden chain in P17).
+static void __attribute__((noinline)) lv_wgroup(const bfloat16 *__restrict h2g,
+                                                const bfloat16 *__restrict wgtg,
+                                                float inv,
+                                                float *__restrict temp)
+{
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+    const aie::vector<float, 32> hf =
+        aie::mul(aie::load_v<32>(h2g), ones_bf).to_vector<float>();
+    const aie::vector<float, 32> wf =
+        aie::mul(aie::load_v<32>(wgtg), ones_bf).to_vector<float>();
+    const aie::vector<float, 32> t =
+        aie::mac(z, hf, aie::broadcast<float, 32>(inv)).to_vector<float>();
+    const aie::vector<float, 32> xn = aie::mac(z, t, wf);
+    aie::store_v(temp, xn);
+}
+
+// ---- K flavors ----
+
+// K=0 X element: stage attn operands + reset ALL per-exec state.
+static void __attribute__((noinline)) lv_xelem(const uint8_t *__restrict a_in)
+{
+    lv_build_arena(reinterpret_cast<const int8_t *__restrict>(a_in));
+    const uint32_t d_words = (kGroups * 2) / 4;
+    const uint32_t *__restrict ds =
+        reinterpret_cast<const uint32_t *__restrict>(a_in + kKMax);
+    uint32_t *__restrict dd =
+        reinterpret_cast<uint32_t *__restrict>(lv_dA);
+    for (uint32_t i = 0; i < d_words; i++)
+        dd[i] = ds[i];
+    // zero the f32 down accumulators once per exec (first partial += )
+    uint32_t *__restrict da =
+        reinterpret_cast<uint32_t *__restrict>(lv_dacc);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < kRowsPerWorker; i++)
+        da[i] = 0;
+    const uint32_t w = *(const uint32_t *__restrict)(a_in + 6400);
+    lv_ctr[cW] = w;
+    lv_ctr[cP] = (w < 4) ? w : 11 - w;
+    lv_ctr[cO] = 0;
+    lv_ctr[cGate] = 0;
+    lv_ctr[cUpG] = 0;
+    lv_ctr[cUpH] = 0;
+    lv_ctr[cChunk] = 255;
+    lv_ctr[cXnI] = 0;
+    lv_ctr[cPhase] = 0;
+    lv_ctr[cDown] = 0;
+    lv_ctr[cR1] = 0;
+    lv_ctr[cR2] = 0;
+    lv_ctr[cR3] = 0;
+}
+
+// K=100 xn element: this worker's x_n chunk (256 bf16).
+static void __attribute__((noinline)) lv_xnelem(const uint8_t *__restrict a_in)
+{
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(a_in);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(lv_xn);
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+        aie::store_v(dst + r, aie::load_v<16>(src + r));
+}
+
+// K=101 (w2, is_w1=0) / K=102 (w1, is_w1=1): rms over the gathered
+// vector in lv_shared, quantize g32, rebuild the replicated arena + d.
+static void __attribute__((noinline)) lv_rms_elem(const uint8_t *__restrict a_in,
+                                                  uint32_t is_w1)
+{
+    const bfloat16 *__restrict h2 =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_shared);
+    float *__restrict temp =
+        reinterpret_cast<float *__restrict>(lv_temp);
+
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    aie::accum<accfloat, 32> sq = aie::zeros<accfloat, 32>();
+    for (uint32_t g = 0; g < kM1 / 32; g++) {
+        const aie::vector<bfloat16, 32> hb = aie::load_v<32>(h2 + g * 32);
+        const aie::vector<float, 32> hf = aie::mul(hb, ones_bf).to_vector<float>();
+        sq = aie::mac(sq, hf, hf);
+    }
+    aie::store_v(temp, sq.to_vector<float>());
+    float sumsq = 0.0f;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 32; i++)
+        sumsq += temp[i];
+
+    // sumsq/2048 rides the vector unit too: LLVM legally rewrites the
+    // division-by-power-of-2 as a mul by the exact reciprocal 2^-11,
+    // and that ONE soft mul was the last __mulsf3 call site. The
+    // vector mul is exact for every normal (and the epsilon add washes
+    // out any denormal tail). lv_temp is dead here (sumsq consumed it).
+    aie::store_v(
+        temp,
+        aie::mul(aie::broadcast<float, 32>(sumsq),
+                 aie::broadcast<float, 32>(0x1p-11f)).to_vector<float>());
+    const float inv = fused_rsqrt(temp[0] + 1e-5f);
+    const bfloat16 *__restrict wgt =
+        reinterpret_cast<const bfloat16 *__restrict>(a_in);
+    uint16_t *__restrict dv =
+        reinterpret_cast<uint16_t *__restrict>(lv_dA);
+    for (uint32_t g = 0; g < kM1 / 32; g++) {
+        lv_wgroup(h2 + 32 * g, wgt + 32 * g, inv, temp);
+        fused_sw_quant(fused_sw_amax(temp), temp, dv + g);
+        fused_sw_x(temp, lv_arena + 128 * g);
+    }
+    lv_ctr[cChunk] = 255;
+    if (is_w1) {
+        lv_ctr[cPhase] = 1;
+    } else {
+        lv_ctr[cGate] = 0;
+        lv_ctr[cUpG] = 0;
+        lv_ctr[cUpH] = 0;
+    }
+}
+
+// K=103 gate block.
+static void __attribute__((noinline)) lv_gateelem(const uint8_t *__restrict a_in)
+{
+    bfloat16 *dst = reinterpret_cast<bfloat16 *__restrict>(lv_gate) +
+                    lv_ctr[cGate] * 16;
+    lv_ctr[cGate]++;
+    lv_compute(a_in,
+               reinterpret_cast<const int8_t *__restrict>(lv_arena),
+               reinterpret_cast<const bfloat16 *__restrict>(lv_dA), dst);
+}
+
+// K=105 down chunk-block: rebuild arena on chunk change, accumulate the
+// bf16-rounded partial into dacc in f32 (c-ascending = bit-exact).
+static void __attribute__((noinline)) lv_downelem(const uint8_t *__restrict a_in)
+{
+    const uint32_t c = *(const uint32_t *__restrict)(a_in + kBlockBytes - 4);
+    if (c != lv_ctr[cChunk]) {
+        lv_build_arena(reinterpret_cast<const int8_t *__restrict>(lv_sw) +
+                       c * kTileK);
+        lv_ctr[cChunk] = c;
+    }
+    bfloat16 *part = reinterpret_cast<bfloat16 *__restrict>(lv_temp);
+    lv_compute(a_in,
+               reinterpret_cast<const int8_t *__restrict>(lv_arena),
+               reinterpret_cast<const bfloat16 *__restrict>(lv_sw + 6144 +
+                                                            c * 128),
+               part);
+    float *__restrict dp = lv_dacc + (lv_ctr[cDown] & 15) * 16;
+    const uint16_t *__restrict pu =
+        reinterpret_cast<const uint16_t *__restrict>(part);
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < 16; r++)
+        dp[r] += fused_bf16_to_f32(pu[r]);
+    lv_ctr[cDown]++;
+}
+
+// K=2048: phase O -> lv_o slice; phase QKV -> the real C element.
+static void __attribute__((noinline)) lv_k2048(const uint8_t *__restrict a_in,
+                                               bfloat16 *__restrict c_out)
+{
+    bfloat16 *dst;
+    if (lv_ctr[cPhase] != 0) {
+        dst = c_out;
+    } else {
+        dst = reinterpret_cast<bfloat16 *__restrict>(lv_o) + lv_ctr[cO] * 16;
+        lv_ctr[cO]++;
+    }
+    lv_compute(a_in,
+               reinterpret_cast<const int8_t *__restrict>(lv_arena),
+               reinterpret_cast<const bfloat16 *__restrict>(lv_dA), dst);
+}
+
+// one group's swiglu: sw = g * sigmoid(g) * u (bf16-rounded), staged f32
+// (P19 fused_sw_sig, verbatim).
+static void __attribute__((noinline)) fused_sw_sig(const bfloat16 *__restrict gp,
+                                                   const bfloat16 *__restrict upp,
+                                                   float *__restrict temp)
+{
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+    const aie::vector<float, 32> negL =
+        aie::broadcast<float, 32>(-1.4426950408889634f);
+    const aie::accum<accfloat, 32> one = aie::mac(z, ones_f, ones_f);
+
+    const aie::vector<float, 32> gv =
+        aie::mul(aie::load_v<32>(gp), ones_bf).to_vector<float>();
+    const aie::vector<float, 32> uv =
+        aie::mul(aie::load_v<32>(upp), ones_bf).to_vector<float>();
+    const aie::vector<float, 32> xarg =
+        aie::mac(z, gv, negL).to_vector<float>();
+    const aie::vector<bfloat16, 32> t = aie::exp2(xarg);
+    const aie::vector<float, 32> tf =
+        aie::mul(t, ones_bf).to_vector<float>();
+    const aie::vector<float, 32> den =
+        aie::mac(one, tf, ones_f).to_vector<float>();
+    const aie::vector<float, 32> sig = aie::div(ones_f, den);
+    const aie::vector<float, 32> gs = aie::mac(z, gv, sig).to_vector<float>();
+    const aie::vector<bfloat16, 32> swb =
+        aie::mac(z, gs, uv).to_vector<bfloat16>();
+    aie::store_v(temp, aie::mul(swb, ones_bf).to_vector<float>());
+}
+
+// integer amax of the staged sw — ROLLED (PMEM law).
+static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp)
+{
+    const uint32_t *__restrict tb =
+        reinterpret_cast<const uint32_t *__restrict>(temp);
+    uint32_t m = 0;
+#pragma clang loop unroll(disable)
+    for (uint32_t j = 0; j < 32; j++) {
+        const uint32_t a = tb[j] & 0x7fffffffu;
+        if (a > m)
+            m = a;
+    }
+    return m;
+}
+
+// d + invd + the RNE magic add, one group (v24e form: broadcasts at
+// function scope, no loops). The two divisions ride the vector unit's
+// aie::div (mul by the hw reciprocal, ~1-2 ulp off IEEE): they were the
+// only __divsf3 callers, and with them gone __divsf3+__muldi3 (~1.2KB)
+// drop out of the 16KB program memory. The ulp drift is invisible at
+// the golden bands (db is bf16 = 2^-8 granularity; invd feeds a scale
+// multiply). lv_qscratch because temp is LIVE across this function.
+static void __attribute__((noinline)) fused_sw_quant(uint32_t m_bits,
+                                                     float *__restrict temp,
+                                                     uint16_t *d_out)
+{
+    float invd = 0.0f;
+    uint16_t db = 0;
+    if (m_bits != 0) {
+        union { uint32_t u; float f; } amax;
+        amax.u = m_bits;
+        float *__restrict scr =
+            reinterpret_cast<float *__restrict>(lv_qscratch);
+        // aie::div returns an ACCUM (it is mul(a, inv(b)) and the mul
+        // yields one) -- store_v's template deduction needs the explicit
+        // .to_vector (fused_sw_sig only compiles because assignment
+        // converts implicitly).
+        aie::store_v(scr, aie::div(aie::broadcast<float, 32>(amax.f),
+                                   aie::broadcast<float, 32>(127.0f))
+                               .to_vector<float>());
+        db = fused_f32_to_bf16(scr[0]);
+        aie::store_v(scr, aie::div(aie::broadcast<float, 32>(1.0f),
+                                   aie::broadcast<float, 32>(
+                                       fused_bf16_to_f32(db)))
+                               .to_vector<float>());
+        invd = scr[0];
+    }
+    *d_out = db;
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+    const aie::accum<accfloat, 32> sc =
+        aie::mac(z, aie::load_v<32>(temp),
+                 aie::broadcast<float, 32>(invd));
+    aie::store_v(temp,
+                 aie::mac(sc, ones_f, aie::broadcast<float, 32>(12582912.0f))
+                     .to_vector<float>());
+}
+
+// q extraction (round-then-clip) + the replicated A-operand store
+// (P19 strided rolled form) — used by the rms pipeline (K=101/102).
+static void __attribute__((noinline)) fused_sw_x(const float *__restrict temp,
+                                                 uint8_t *__restrict dst)
+{
+    const uint32_t *__restrict tb =
+        reinterpret_cast<const uint32_t *__restrict>(temp);
+#pragma clang loop unroll(disable)
+    for (uint32_t j = 0; j < 16; j++) {
+        int32_t q0 = (int32_t)tb[j] - 0x4B400000;
+        int32_t q1 = (int32_t)tb[j + 16] - 0x4B400000;
+        if (q0 > 127) q0 = 127;
+        if (q0 < -127) q0 = -127;
+        if (q1 > 127) q1 = 127;
+        if (q1 < -127) q1 = -127;
+        const uint8_t r0 = (uint8_t)q0;
+        const uint8_t r1 = (uint8_t)q1;
+        for (uint32_t k = 0; k < 4; k++) {
+            dst[j + 16 * k] = r0;
+            dst[64 + j + 16 * k] = r1;
+        }
+    }
+}
+
+// LINEAR 32B q extraction (ring2's global-j layout — no replication;
+// down's K=105 rebuild does the replication later).
+static void __attribute__((noinline)) lv_sw_x32(const float *__restrict temp,
+                                                uint8_t *__restrict dst)
+{
+    const uint32_t *__restrict tb =
+        reinterpret_cast<const uint32_t *__restrict>(temp);
+#pragma clang loop unroll(disable)
+    for (uint32_t j = 0; j < 16; j++) {
+        int32_t q0 = (int32_t)tb[j] - 0x4B400000;
+        int32_t q1 = (int32_t)tb[j + 16] - 0x4B400000;
+        if (q0 > 127) q0 = 127;
+        if (q0 < -127) q0 = -127;
+        if (q1 > 127) q1 = 127;
+        if (q1 < -127) q1 = -127;
+        dst[j] = (uint8_t)q0;
+        dst[16 + j] = (uint8_t)q1;
+    }
+}
+
+// K=104 up block: window half fill; every completed 32-value pair runs
+// one swiglu group with global index g = p*24 + k.
+static void __attribute__((noinline)) lv_upelem(const uint8_t *__restrict a_in)
+{
+    bfloat16 *dst = reinterpret_cast<bfloat16 *__restrict>(lv_upwin) +
+                    lv_ctr[cUpH] * 16;
+    lv_compute(a_in,
+               reinterpret_cast<const int8_t *__restrict>(lv_arena),
+               reinterpret_cast<const bfloat16 *__restrict>(lv_dA), dst);
+    if (lv_ctr[cUpH] == 1) {
+        const uint32_t g = lv_ctr[cP] * kGrpPerWorker + lv_ctr[cUpG];
+        float *__restrict temp =
+            reinterpret_cast<float *__restrict>(lv_temp);
+        fused_sw_sig(reinterpret_cast<const bfloat16 *__restrict>(lv_gate) +
+                         lv_ctr[cUpG] * 32,
+                     reinterpret_cast<const bfloat16 *__restrict>(lv_upwin),
+                     temp);
+        fused_sw_quant(fused_sw_amax(temp), temp,
+                       reinterpret_cast<uint16_t *__restrict>(lv_sw + 6144 +
+                                                              2 * g));
+        lv_sw_x32(temp, lv_sw + 32 * g);
+        lv_ctr[cUpG]++;
+        lv_ctr[cUpH] = 0;
+    } else {
+        lv_ctr[cUpH] = 1;
+    }
+}
+
+// ---- dispatcher (P16 stack law: tiny, tail-calls noinline flavors) ----
+static void lv_body(const uint8_t *__restrict a_in, bfloat16 *c_out)
+{
+    const uint32_t k = *(const uint32_t *__restrict)(a_in + kBlockBytes - 8);
+    if (k == kTileK) {
+        lv_k2048(a_in, c_out);
+        return;
+    }
+    if (k == 0) {
+        lv_xelem(a_in);
+        return;
+    }
+    if (k == 100) {
+        lv_xnelem(a_in);
+        return;
+    }
+    if (k == 101) {
+        lv_rms_elem(a_in, 0);
+        return;
+    }
+    if (k == 102) {
+        lv_rms_elem(a_in, 1);
+        return;
+    }
+    if (k == 103) {
+        lv_gateelem(a_in);
+        return;
+    }
+    if (k == 104) {
+        lv_upelem(a_in);
+        return;
+    }
+    if (k == 105) {
+        lv_downelem(a_in);
+        return;
+    }
+    // unknown K: no-op (the fill never produces one)
+}
+
+extern "C" {
+
+// C-producing entry: the qkv flavor (and any future C-producing
+// flavor). Signature-trimmed (PMEM law): m/group_size/tile_idx were
+// ignored — and every trimmed arg is a wrapper-side constant the MLIR
+// call site materializes in program memory.
+void w4gemvu_layer_bf16(const uint8_t *__restrict a_in,
+                        bfloat16 *__restrict c_out)
+{
+    lv_body(a_in, c_out);
+}
+
+// No-C entry: every flavor that acquires no C element (MLIR cannot
+// pass a null memref; c_out routes to dead scratch and only the QKV
+// phase of K=2048 would ever dereference it — which this entry never
+// receives by construction).
+void w4gemvu_layer_a(const uint8_t *__restrict a_in)
+{
+    lv_body(a_in, reinterpret_cast<bfloat16 *__restrict>(lv_dummy));
+}
+
+// ---- ring helpers (fifo acquire/release live in the design's worker
+// body; these are the data moves between them) ----
+
+// ring1 make: x'_p = bf16(f32(x_n) + f32(o)) for the OWN chunk, into
+// the outgoing element AND the own slot of lv_shared.
+void lv_fr1(uint8_t *__restrict ob)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+    const uint32_t p = lv_ctr[cP];
+    const bfloat16 *__restrict xn =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_xn);
+    const bfloat16 *__restrict oo =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_o);
+    bfloat16 *__restrict sh =
+        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * 256;
+    bfloat16 *__restrict dst = reinterpret_cast<bfloat16 *__restrict>(ob);
+#pragma clang loop unroll(disable)
+    for (uint32_t g = 0; g < kRowsPerWorker / 32; g++) {
+        aie::accum<accfloat, 32> a =
+            aie::mul(aie::load_v<32>(xn + g * 32), ones_bf);
+        a = aie::mac(a, ones_f,
+                     aie::mul(aie::load_v<32>(oo + g * 32), ones_bf)
+                         .to_vector<float>());
+        const aie::vector<bfloat16, 32> v = a.to_vector<bfloat16>();
+        aie::store_v(dst + g * 32, v);
+        aie::store_v(sh + g * 32, v);
+    }
+    lv_ctr[cR1] = 1;
+}
+
+// ring1 forward (512B) — also ring3's forward (same r13 fifo, same
+// element size).
+void lv_fw1(const uint8_t *__restrict s, uint8_t *__restrict ob)
+{
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(s);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(ob);
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+        aie::store_v(dst + r, aie::load_v<16>(src + r));
+}
+
+// ring1 store: slot (p - r1r) & 7 of lv_shared.
+void lv_st1(const uint8_t *__restrict s)
+{
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR1]) & 7;
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(s);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * 256;
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+        aie::store_v(dst + r, aie::load_v<16>(src + r));
+    lv_ctr[cR1]++;
+}
+
+// ring2 make: own 768 int8 q + 48B of scales -> 832B element.
+void lv_fr2(uint8_t *__restrict ob)
+{
+    const uint32_t p = lv_ctr[cP];
+    const uint8_t *__restrict q = lv_sw + p * 768;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 768; i += 32) {
+        const auto v = aie::load_v<32>(q + i);
+        aie::store_v(ob + i, v);
+    }
+    // AIE ALIGNMENT LAW (P28-4 root cause): a 32B vector op at a
+    // 16-mod-32 address is undefined on AIE2 -- the [ptr, stream-off]
+    // hardware form truncates to its natural 32B boundary, so the 48B
+    // per-position scale stride scrambled every odd position (slot
+    // (p+1) k16-23 clobbered, odd slot k8-15 never written). 16B ops at
+    // 48p + {0,16,32} are all 16B-aligned (48p = 0 mod 16); the 16B
+    // form was already proven by the old tail op surviving clean.
+    const uint16_t *__restrict sc =
+        reinterpret_cast<const uint16_t *__restrict>(lv_sw + 6144 + p * 48);
+    uint16_t *__restrict d2 =
+        reinterpret_cast<uint16_t *__restrict>(ob + 768);
+    aie::store_v(d2, aie::load_v<8>(sc));
+    aie::store_v(d2 + 8, aie::load_v<8>(sc + 8));
+    aie::store_v(d2 + 16, aie::load_v<8>(sc + 16));
+    lv_ctr[cR2] = 1;
+}
+
+// ring2 forward: EXACTLY 832B = 26 x 32B chunks — never overrun into
+// the adjacent depth-2 fifo buffer.
+void lv_fw2(const uint8_t *__restrict s, uint8_t *__restrict ob)
+{
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 832; i += 32) {
+        const auto v = aie::load_v<32>(s + i);
+        aie::store_v(ob + i, v);
+    }
+}
+
+// ring2 store: int8 -> slot*768, scales -> 6144 + slot*48.
+void lv_st2(const uint8_t *__restrict s)
+{
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR2]) & 7;
+    uint8_t *__restrict q = lv_sw + slot * 768;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 768; i += 32) {
+        const auto v = aie::load_v<32>(s + i);
+        aie::store_v(q + i, v);
+    }
+    // Same alignment law as lv_fr2: three 16B ops, all 16B-aligned.
+    const uint16_t *__restrict sc =
+        reinterpret_cast<const uint16_t *__restrict>(s + 768);
+    uint16_t *__restrict d2 =
+        reinterpret_cast<uint16_t *__restrict>(lv_sw + 6144 + slot * 48);
+    aie::store_v(d2, aie::load_v<8>(sc));
+    aie::store_v(d2 + 8, aie::load_v<8>(sc + 8));
+    aie::store_v(d2 + 16, aie::load_v<8>(sc + 16));
+    lv_ctr[cR2]++;
+}
+
+// ring3 make: xn1 = bf16(f32(x') + dacc), into the outgoing element AND
+// the own lv_shared slot. x' itself is RECOMPUTED from the retained
+// lv_xn/lv_o chunks (t = bf16(f32(xn) + f32(o)) — the identical rounding
+// fr1 applied) because lv_shared's x' image is dead after K=101's rms:
+// the gate/up windows alias that space (see the overlay note above).
+void lv_fr3(uint8_t *__restrict ob)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+    const uint32_t p = lv_ctr[cP];
+    const bfloat16 *__restrict xn =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_xn);
+    const bfloat16 *__restrict oo =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_o);
+    bfloat16 *__restrict sh =
+        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * 256;
+    const float *__restrict da = lv_dacc;
+    bfloat16 *__restrict dst = reinterpret_cast<bfloat16 *__restrict>(ob);
+#pragma clang loop unroll(disable)
+    for (uint32_t g = 0; g < kRowsPerWorker / 32; g++) {
+        aie::accum<accfloat, 32> a =
+            aie::mul(aie::load_v<32>(xn + g * 32), ones_bf);
+        a = aie::mac(a, ones_f,
+                     aie::mul(aie::load_v<32>(oo + g * 32), ones_bf)
+                         .to_vector<float>());
+        const aie::vector<float, 32> tf =
+            aie::mul(a.to_vector<bfloat16>(), ones_bf).to_vector<float>();
+        aie::accum<accfloat, 32> b = aie::mac(z, ones_f, tf);
+        b = aie::mac(b, ones_f, aie::load_v<32>(da + g * 32));
+        const aie::vector<bfloat16, 32> v = b.to_vector<bfloat16>();
+        aie::store_v(dst + g * 32, v);
+        aie::store_v(sh + g * 32, v);
+    }
+    lv_ctr[cR3] = 1;
+}
+
+// ring3 store: overwrite slot's x' with xn1.
+void lv_st3(const uint8_t *__restrict s)
+{
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR3]) & 7;
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(s);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * 256;
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+        aie::store_v(dst + r, aie::load_v<16>(src + r));
+    lv_ctr[cR3]++;
+}
+
+// drain one 16-bf16 piece of the OWN xn1 chunk as a C element.
+void lv_cxn(uint8_t *__restrict c)
+{
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t i = lv_ctr[cXnI]++;
+    const uint32_t p = lv_ctr[cP];
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(lv_shared) + p * 256 + i * 16;
+    aie::store_v(reinterpret_cast<uint16_t *__restrict>(c),
+                 aie::load_v<16>(src));
+}
+
+} // extern "C"
