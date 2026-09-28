@@ -44,7 +44,12 @@ offsets — each column has its own tap, the gap is just arithmetic).
 Dummy groups ahead of real section rows (each glue element emits a
 zero C): gate/up sections 2 dummies (K=1 + K=3), down 2 (K=4 + K=5),
 qkv 3 (K=2 + K=1 re-read + K=3). o has 1 (the X element). The qkv
-sections are 27 written groups on a 28-group stride.
+sections are 27 written groups on a 28-group stride. P20: the section
+dummies never CROSS a group boundary anymore — tg3/tg4 drain their two
+window-fill zero Cs to the padA/padB dead rows within their own group,
+C3 covers the 48 down blocks (+2 dummy rows stay at c_init zeros), and
+C4 re-consumes its K=3 head's zero C in-group (25 groups at +2 dummies,
+block 0 on row 48).
 
 residual2 = x' = x + o_out is NOT host-computable before the exec
 (o_out is produced by tg1), so tg4 carries a THIRD fill: a re-read of
@@ -54,8 +59,15 @@ is byte-identical to tg2's, so its header still says K=1. The
 resulting h2' lands at the residual slot the K=3 glue already reads.
 
 BD law (P16): every task group keeps <= 4 fills per shim ahead of its
-drain — 2 / 2 / 3 / 3 here. (Fallback if the board hangs: split tg3
-and tg4 into two groups each, back to the proven 2F+1D shape.)
+drain. P20 hardened this to the exact proven pair shape: EVERY group
+now carries its fills plus its OWN drain (2F+1D max, fills-between-
+drains <= 2). The original design let tg3/tg4's K=4/K=5 (K=2/K=1')
+zero Cs PARK in the depth-2 C fifo across the task-group boundary
+until the next group's drain consumed them as section dummies — and
+that cross-group handoff raced on ~1-3% of execs: the run timed out
+with a whole-column down or qkv chunk missing, the first missing row
+always a section's first data row (P20 fingerprints). The glue zero Cs
+now drain to the padA/padB dead rows within their own group.
 """
 
 ELEM = 18560
@@ -254,22 +266,54 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
         )
         for col in range(cols)
     ]
-    # down C drains: 2 dummy groups (K=4 + K=5 zero Cs).
+    # down C drains: real blocks only, +2 dummy rows of section skip —
+    # P20: the K=4/K=5 zero Cs are drained by tg3 itself (below), so the
+    # dummy rows are never written (c_init zeros, matching the zeros the
+    # parked dummy groups used to leave there).
     C3_taps = [
         TensorAccessPattern(
             tensor_dims=(1, c_total_rows),
-            offset=WIN2_OFF + col * sec_dn,
-            sizes=[1, 1, blocks_dn + 2, M_INPUT],
+            offset=WIN2_OFF + col * sec_dn + 2 * M_INPUT,
+            sizes=[1, 1, blocks_dn, M_INPUT],
             strides=[0, 0, M_INPUT, 1],
         )
         for col in range(cols)
     ]
-    # qkv C drains: 3 dummy groups (K=2, K=1 re-read, K=3 zero Cs).
+    # qkv C drains: the K=2/K=1' zero Cs go with tg4's own glue drain;
+    # the K=3 #2 head element rides the A4 fill (filled AND consumed
+    # within tg4b — the same in-group head pattern C2 uses), so this
+    # drain pops [K=3 zero | 24 blocks] = 25 groups at +2 dummy groups,
+    # landing block 0 on row 48 where the host readback expects it.
     C4_taps = [
         TensorAccessPattern(
             tensor_dims=(1, c_total_rows),
-            offset=QKV_OFF + col * sec_q,
-            sizes=[1, 1, blocks_q + 3, M_INPUT],
+            offset=QKV_OFF + col * sec_q + 2 * M_INPUT,
+            sizes=[1, 1, blocks_q + 1, M_INPUT],
+            strides=[0, 0, M_INPUT, 1],
+        )
+        for col in range(cols)
+    ]
+    # P20: tg3/tg4's own drains for the glue zero Cs (2 groups x 16 rows
+    # per column), landed in the padA/padB interiors — element payload the
+    # kernels never read (headers sit at the very pad tail) and no other
+    # tap touches. Restores the proven pair choreography: no C element
+    # ever crosses a task-group boundary inside the fifo.
+    GLUE_C3_OFF = GATE_OFF + 4 * sec_gu + 48  # 15600, padA interior
+    GLUE_C4_OFF = UP_OFF + 4 * sec_gu + 48  # 24880, padB interior
+    glue3_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, c_total_rows),
+            offset=GLUE_C3_OFF + col * 2 * M_INPUT,
+            sizes=[1, 1, 2, M_INPUT],
+            strides=[0, 0, M_INPUT, 1],
+        )
+        for col in range(cols)
+    ]
+    glue4_taps = [
+        TensorAccessPattern(
+            tensor_dims=(1, c_total_rows),
+            offset=GLUE_C4_OFF + col * 2 * M_INPUT,
+            sizes=[1, 1, 2, M_INPUT],
             strides=[0, 0, M_INPUT, 1],
         )
         for col in range(cols)
@@ -303,19 +347,17 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
             rt.drain(C_fifos[i].cons(), C, C2_taps[i], task_group=tg2, wait=True)
         rt.finish_task_group(tg2)
 
-        # tg3: gate window (K=4) + up window (K=5) + down's 48 blocks —
-        # down ships NO X and NO head: K=5 prebuilt its A operands.
-        # Split 3F+1D -> [2F | 1F+1D] (the documented fallback): with all
-        # three fills in one group the first board run REDELIVERED a tg2
-        # gateup block element (a duplicate compute C landed as down
-        # section dummy group 0) — every group now matches the proven
-        # P16/P18 <= 2F+1D BD shape. The K=4/K=5 zero Cs park in the C
-        # fifo (depth 2 holds exactly both) until tg3b's drain consumes
-        # them as the down dummies.
+        # tg3: gate window (K=4) + up window (K=5), each glue zero C
+        # drained HERE to the padA dead rows (P20 — see glue3_taps; they
+        # used to park in the C fifo for tg3b's drain, the ~1-3%/exec
+        # cross-group hang). down ships NO X and NO head: K=5 prebuilt
+        # its A operands.
         tg3 = rt.task_group()
         for i in range(cols):
             rt.fill(A_fifos[i].prod(), C, swa_taps[i], task_group=tg3)
             rt.fill(A_fifos[i].prod(), C, swb_taps[i], task_group=tg3)
+        for i in range(cols):
+            rt.drain(C_fifos[i].cons(), C, glue3_taps[i], task_group=tg3, wait=True)
         rt.finish_task_group(tg3)
 
         tg3b = rt.task_group()
@@ -327,13 +369,14 @@ def my_w4gemvu_quad(dev, cols, M1, K1, M2, M3, K3, M4, group_size=32):
 
         # tg4: win2 (K=2, down partials + residual2) + the win1 re-read
         # (K=1 + quad flag -> stage1r stages h2' = x + o_out over the
-        # residual slot) + [K=3 w element | 24 qkv blocks]. Same 3F -> 2F
-        # + 1F split: the K=2/K=1' zero Cs park in the C fifo until tg4b's
-        # drain reads them as the qkv dummies.
+        # residual slot), the K=2/K=1' zero Cs drained here to padB
+        # (glue4_taps, same P20 restructure).
         tg4 = rt.task_group()
         for i in range(cols):
             rt.fill(A_fifos[i].prod(), C, win2_taps[i], task_group=tg4)
             rt.fill(A_fifos[i].prod(), C, win1_taps[i], task_group=tg4)
+        for i in range(cols):
+            rt.drain(C_fifos[i].cons(), C, glue4_taps[i], task_group=tg4, wait=True)
         rt.finish_task_group(tg4)
 
         tg4b = rt.task_group()
