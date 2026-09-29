@@ -26,6 +26,10 @@ def generate_test_params(extensive=False):
             (4096, 64, 8, 8, 0),
             # d=128 (MiniCPM5 head_dim): PV matmul + layout generalization
             (2048, 128, 16, 8, 0),
+            # P28-11: hy-mt2 decode geometry — GQA 16Q/4KV at d=128 was
+            # never on board (R2b tested MHA-only). S=1024 = cache_seq
+            # (no padding, 5/5 PASS).
+            (1024, 128, 16, 8, 4),
         ]
 
     for seq_len, head_dim, heads, number_of_pipeline, num_kv_heads in params:
@@ -47,6 +51,33 @@ all_params = [
     pytest.param(*params, marks=pytest.mark.extensive, id=name)
     for params, name in zip(extensive_params, extensive_names)
 ]
+
+# P28-11: the padded-S shapes (S=128/256 -> padded to B*pipelines=512)
+# fail WHOLESALE on board (~525k/787k errors of ~262k/524k values): the
+# pad path feeds K columns into the softmax UNMASKED — zero vectors earn
+# e^0=1 weight and wreck the normalization. Every pre-existing upstream
+# shape divides B*pipelines exactly, so this path was never exercised.
+# Decode (S_kv = pos+1, always variable) must NOT use this op as-is:
+# the layer-v3 kernel carries runtime-S masking instead.
+for s_pad_broken in (256, 128):
+    all_params.append(
+        pytest.param(
+            s_pad_broken,
+            128,
+            16,
+            8,
+            4,
+            marks=[
+                pytest.mark.extensive,
+                pytest.mark.xfail(
+                    reason="P28-11: padded-S path unmasked in softmax — "
+                    "known broken for any S not divisible by "
+                    "B*pipelines"
+                ),
+            ],
+            id=f"mha_{s_pad_broken}_128_16_8_4",
+        )
+    )
 
 
 @pytest.mark.metrics(
