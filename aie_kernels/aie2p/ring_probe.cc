@@ -24,3 +24,7 @@ extern "C" void ring_copy_bf16(const bfloat16 *__restrict src, bfloat16 *__restr
         aie::store_v(dst + i, v);
     }
 }
+
+// P28-6 dumb-gather discriminator kernels live in w4gemvu_layer.cc
+// (iron: one binary per worker) -- see ring_touch1/ring_copy128_bf16
+// there and perf-lab 6f-2.

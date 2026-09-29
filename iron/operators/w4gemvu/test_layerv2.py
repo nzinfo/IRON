@@ -2,18 +2,31 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
 """P28 layer-v2 test: the WHOLE transformer layer in ONE task group per
-exec on 8 persistent ring workers (design_layerv2.py + w4gemvu_layer.cc).
+exec on N persistent ring workers (design_layerv2.py + w4gemvu_layer.cc).
+
+P28-6: N is a test PARAMETER (8/16/32) -- the kernel reads the worker
+count from the X element ([6404,6408) u32) so one .o serves every width.
+N=8 is the regression anchor (expected bit-identical to P28-4); 16/32
+light up the widened ring.
 
 The golden mirrors the kernel's flavor chain end to end (the P16/P19
 bit-path mirrors, reused from test_quad): o -> ring1 gather x' -> rms2 ->
 gate/up -> swiglu -> ring2 gather sw -> down -> ring3 gather xn1 -> rms1
--> qkv, with the drain tensor carrying per-worker [qkv 384 | xn1 256]
-rows that the test reassembles by ring position.
+-> qkv, with the drain tensor carrying per-worker [qkv 3072/N | xn1
+2048/N] rows that the test reassembles by ring position.
 
 Weight elements: the standard packer tiles, except gate/up/down blocks
-carry K=103/104/105 headers (the packer writes 2048 — the fixture
+carry K=103/104/105 headers (the packer writes 2048 -- the fixture
 patches them) so the kernel's dispatcher routes each block to its
 flavor; o/qkv blocks keep 2048 and ride the phase word.
+
+SUB-COLUMN SLICING LAW (P28-6): the v4 packs are 8-column (a column
+spans M/8 rows), so a position's row range only coincides with a whole
+column when N=8. For N=16/32 the position's 16-row blocks are the
+t-subrange [t0, t0+span/16) of pack column col = r0 // (M/8), per chunk
+for K=6144 matrices -- sliced explicitly, never as a flat p*count run
+(which silently scrambles gate/up/down for N>8; a position's span
+always divides the per-column row count, so runs never straddle).
 """
 
 import struct
@@ -35,20 +48,35 @@ from iron.common import (
 )
 from iron.common.test_utils import run_test
 from iron.operators.w4gemvu import reference
+from iron.operators.w4gemvu.design_layerv2 import ring_tables
 from iron.operators.w4gemvu.reference import ELEM, TILE_K
 
-COLS = 8
-SUCC = {0: 1, 1: 2, 2: 3, 3: 7, 7: 6, 6: 5, 5: 4, 4: 0}  # mirror of design_layerv2
+HIDDEN, INTER, QKV_M = 2048, 6144, 3072
 
 
-def pos(w):
-    """Worker index -> ring position (serpentine)."""
-    return w if w < 4 else 11 - w
+def geom(n):
+    """Per-N geometry mirror of design_layerv2.my_layerv2."""
+    rows = HIDDEN // n
+    N_O = rows // 16
+    N_GATE = (INTER // n) // 16
+    N_QKV = (QKV_M // n) // 16
+    g = {
+        "n": n, "rows": rows, "jpw": INTER // n,
+        "N_O": N_O, "N_GATE": N_GATE,
+        "N_UP": N_GATE, "N_DOWN": 3 * N_O, "N_QKV": N_QKV, "N_CXN": N_O,
+        "qkv_rows": QKV_M // n,
+        "N_WELEM": N_O + N_GATE + N_GATE + 3 * N_O + N_QKV + 2,
+    }
+    # ring order straight from the design (serpentine N=8, all-adjacent
+    # Hamiltonian cycle N=16 -- the CORE<->CORE OBJECTFIFO LAW in
+    # design_layerv2.ring_tables; one source of truth, no mirror to rot)
+    order, _ = ring_tables(n)
+    g["order"] = order
+    g["pos"] = order.index  # worker id -> ring position
+    return g
 
 
-N_O, N_GATE, N_UP, N_DOWN, N_QKV = 16, 48, 48, 48, 24
-N_WELEM = N_O + N_GATE + N_UP + N_DOWN + N_QKV + 2  # + w2 + w1 = 186
-OUT_ROWS = (N_QKV + 16) * 16  # 40 C elements per worker = 640 rows
+G8 = geom(8)  # default geometry for module-level helpers
 
 
 def _f32(bf16_bits):
@@ -129,64 +157,91 @@ def _patch_k(elem_bytes, k):
     elem_bytes[ELEM - 8 : ELEM - 4] = _u32(k)
 
 
-def build_worker_weights(p, packed_o, packed_g, packed_u, packed_d, packed_q, wgt2, wgt1):
-    """Worker at ring position p: its 186-element A stream in fill order
-    [o x16 | w2 | gate x48 | up x48 | down x48 | w1 | qkv x24]. The
-    packer's column p tiles ARE position p's rows; gate/up/down get their
-    flavor K headers patched in."""
-    w = np.zeros(N_WELEM * ELEM, dtype=np.uint8)
+def _sub_blocks(packed, M, p, rows_per_pos, chunks=1, chunk=0):
+    """Position p's 16-row blocks of an 8-column (M, 2048) pack (or of
+    chunk `chunk` of an (M, 6144) pack), where a position owns
+    rows_per_pos rows: the contiguous t-run [t0, t0+rows_per_pos/16) of
+    pack column col -- see the SUB-COLUMN SLICING LAW above. A column
+    spans M/8 ROWS no matter the K-chunking (K=6144 tiles are stored 3
+    chunk-major blocks per 16 rows, empirically pinned: block b -> col
+    b//48, chunk (b%48)//16, tile (b%48)%16), so rows_per_col is NOT
+    divided by chunks -- chunks multiplies the block stride, not the row
+    span. Never straddles a column (rows_per_pos divides rows_per_col
+    for every matrix here). Returns the byte slice."""
+    rows_per_col = M // 8
+    r0 = p * rows_per_pos
+    col, t0 = r0 // rows_per_col, (r0 % rows_per_col) // 16
+    T = rows_per_col // 16
+    base = (col * chunks + chunk) * T + t0
+    cnt = rows_per_pos // 16
+    return packed[base * ELEM : (base + cnt) * ELEM], cnt
+
+
+def build_worker_weights(g, p, packed_o, packed_g, packed_u, packed_d, packed_q, wgt2, wgt1):
+    """Worker at ring position p: its N_WELEM-element A stream in fill
+    order [o xN_O | w2 | gate xN_GATE | up xN_UP | down xN_DOWN | w1 |
+    qkv xN_QKV]. All matrices are sliced by the pack sub-column law."""
+    rows, jpw, N_O, N_GATE = g["rows"], g["jpw"], g["N_O"], g["N_GATE"]
+    w = np.zeros(g["N_WELEM"] * ELEM, dtype=np.uint8)
     blk = ELEM
 
     def put(idx, src):
         w[idx * blk : (idx + 1) * blk] = src
 
-    o0 = p * N_O * blk
+    run, _ = _sub_blocks(packed_o, 2048, p, rows)
     for i in range(N_O):
-        put(i, packed_o[o0 + i * blk : o0 + (i + 1) * blk])
+        put(i, run[i * blk : (i + 1) * blk])
     put(N_O, _norm_element(wgt2, 101))
-    g0 = p * N_GATE * blk
+    run, _ = _sub_blocks(packed_g, 6144, p, jpw)
     for i in range(N_GATE):
-        e = packed_g[g0 + i * blk : g0 + (i + 1) * blk].copy()
+        e = run[i * blk : (i + 1) * blk].copy()
         _patch_k(e, 103)
         put(N_O + 1 + i, e)
-    u0 = p * N_UP * blk
-    for i in range(N_UP):
-        e = packed_u[u0 + i * blk : u0 + (i + 1) * blk].copy()
+    run, _ = _sub_blocks(packed_u, 6144, p, jpw)
+    for i in range(N_GATE):
+        e = run[i * blk : (i + 1) * blk].copy()
         _patch_k(e, 104)
         put(N_O + 1 + N_GATE + i, e)
-    d0 = p * N_DOWN * blk
-    for i in range(N_DOWN):
-        e = packed_d[d0 + i * blk : d0 + (i + 1) * blk].copy()
-        _patch_k(e, 105)
-        put(N_O + 1 + N_GATE + N_UP + i, e)
-    put(N_O + 1 + N_GATE + N_UP + N_DOWN, _norm_element(wgt1, 102))
-    q0 = p * N_QKV * blk
+    # down: c-major chunk blocks, each chunk's run sliced by the same law
+    N_DOWN = g["N_DOWN"]
+    for c in range(3):
+        run, _ = _sub_blocks(packed_d, 2048, p, rows, chunks=3, chunk=c)
+        for i in range(N_O):
+            e = run[i * blk : (i + 1) * blk].copy()
+            _patch_k(e, 105)
+            put(N_O + 1 + 2 * N_GATE + c * N_O + i, e)
+    put(N_O + 1 + 2 * N_GATE + N_DOWN, _norm_element(wgt1, 102))
+    run, _ = _sub_blocks(packed_q, 3072, p, g["qkv_rows"])
+    N_QKV = g["N_QKV"]
     for i in range(N_QKV):
-        put(N_WELEM - N_QKV + i, packed_q[q0 + i * blk : q0 + (i + 1) * blk])
+        put(g["N_WELEM"] - N_QKV + i, run[i * blk : (i + 1) * blk])
     return w
 
 
-def build_x_element(q1, d1, worker_id):
+def build_x_element(q1, d1, worker_id, n):
     """K=0: attn int8 q at [0,2048), d bf16[64] at [6144,6400), worker id
-    u32 at [6400,6404) (the kernel derives ring position from it)."""
+    u32 at [6400,6404), worker count N u32 at [6404,6408) (the kernel
+    derives ring position + all geometry from these two words)."""
     e = np.zeros(ELEM, dtype=np.uint8)
     e[0:2048] = q1.numpy().view(np.uint8)
     e[6144:6272] = d1.view(torch.uint16).numpy().view(np.uint8)
     e[6400:6404] = _u32(worker_id)
+    e[6404:6408] = _u32(n)
     e[ELEM - 8 : ELEM - 4] = _u32(0)
     return e
 
 
-def build_xn_element(x_n_bf16, p):
-    """K=100: this position's residual chunk (256 bf16) at [0,512)."""
+def build_xn_element(x_n_bf16, p, rows):
+    """K=100: this position's residual chunk (rows bf16) at [0,rows*2)."""
     e = np.zeros(ELEM, dtype=np.uint8)
-    chunk = x_n_bf16[p * 256 : (p + 1) * 256]
-    e[0:512] = chunk.view(torch.uint16).numpy().view(np.uint8)
+    chunk = x_n_bf16[p * rows : (p + 1) * rows]
+    e[0 : rows * 2] = chunk.view(torch.uint16).numpy().view(np.uint8)
     e[ELEM - 8 : ELEM - 4] = _u32(100)
     return e
 
 
-def generate_layerv2_reference(seed=42):
+def generate_layerv2_reference(seed=42, n=8):
+    g = geom(n)
     torch.manual_seed(seed)
     W_o = (torch.rand(2048, 2048, dtype=torch.float32) * 2 - 1).numpy()
     W_g = (torch.rand(6144, 2048, dtype=torch.float32) * 2 - 1).numpy()
@@ -258,21 +313,23 @@ def generate_layerv2_reference(seed=42):
     qkv = (W_q_f @ x_deq4).to(torch.bfloat16)
 
     # ---- assemble the tensors the exec consumes/produces ----
-    weights = np.zeros(COLS * N_WELEM * ELEM, dtype=np.uint8)
-    x_elems = np.zeros(COLS * ELEM, dtype=np.uint8)
-    xn_elems = np.zeros(COLS * ELEM, dtype=np.uint8)
-    out = torch.zeros(COLS * OUT_ROWS, dtype=torch.bfloat16)
-    for w in range(COLS):
-        p = pos(w)
-        weights[w * N_WELEM * ELEM : (w + 1) * N_WELEM * ELEM] = build_worker_weights(
-            p, packed_o, packed_g, packed_u, packed_d, packed_q, wgt2, wgt1
-        )
-        x_elems[w * ELEM : (w + 1) * ELEM] = build_x_element(q1, d1, w)
-        xn_elems[w * ELEM : (w + 1) * ELEM] = build_xn_element(x_n, p)
-        base = w * OUT_ROWS
-        out[base : base + 384] = qkv[p * 384 : (p + 1) * 384]
-        out[base + 384 : base + OUT_ROWS] = torch.from_numpy(
-            xn1_bits[p * 256 : (p + 1) * 256].view(np.uint16)
+    rows, qkv_rows = g["rows"], g["qkv_rows"]
+    out_rows = (g["N_QKV"] + g["N_CXN"]) * 16  # qkv_rows + rows
+    weights = np.zeros(n * g["N_WELEM"] * ELEM, dtype=np.uint8)
+    x_elems = np.zeros(n * ELEM, dtype=np.uint8)
+    xn_elems = np.zeros(n * ELEM, dtype=np.uint8)
+    out = torch.zeros(n * out_rows, dtype=torch.bfloat16)
+    for w in range(n):
+        p = g["pos"](w)
+        weights[w * g["N_WELEM"] * ELEM : (w + 1) * g["N_WELEM"] * ELEM] = (
+            build_worker_weights(g, p, packed_o, packed_g, packed_u, packed_d,
+                                 packed_q, wgt2, wgt1))
+        x_elems[w * ELEM : (w + 1) * ELEM] = build_x_element(q1, d1, w, n)
+        xn_elems[w * ELEM : (w + 1) * ELEM] = build_xn_element(x_n, p, rows)
+        base = w * out_rows
+        out[base : base + qkv_rows] = qkv[p * qkv_rows : (p + 1) * qkv_rows]
+        out[base + qkv_rows : base + out_rows] = torch.from_numpy(
+            xn1_bits[p * rows : (p + 1) * rows].view(np.uint16)
         ).view(torch.bfloat16)
 
     return {
@@ -286,7 +343,7 @@ def generate_layerv2_reference(seed=42):
 
 
 class AIELayerV2(AIEOperatorBase):
-    def __init__(self, cols=COLS, context=None):
+    def __init__(self, cols=G8["n"], context=None):
         self.cols = cols
         AIEOperatorBase.__init__(self, context=context)
 
@@ -327,10 +384,12 @@ class AIELayerV2(AIEOperatorBase):
         self.add_artifacts([xclbin_artifact, insts_artifact])
 
     def set_up_runtime(self):
-        self.add_buffer("weights", self.cols * N_WELEM * ELEM, dtype=np.uint8)
+        g = geom(self.cols)
+        out_rows = (g["N_QKV"] + g["N_CXN"]) * 16
+        self.add_buffer("weights", self.cols * g["N_WELEM"] * ELEM, dtype=np.uint8)
         self.add_buffer("x", self.cols * ELEM, dtype=np.uint8)
         self.add_buffer("xn", self.cols * ELEM, dtype=np.uint8)
-        self.add_buffer("output", self.cols * OUT_ROWS, dtype=bfloat16)
+        self.add_buffer("output", self.cols * out_rows, dtype=bfloat16)
         self.add_kernel(
             "w4gemvu_layerv2",
             self.xclbin_artifact,
@@ -344,10 +403,23 @@ class AIELayerV2(AIEOperatorBase):
 @pytest.mark.metrics(
     Latency=r"Latency \(us\): (?P<value>[\d\.]+)",
 )
-def test_layerv2(aie_context):
-    golden = generate_layerv2_reference()
+# SHIM CHANNEL LAW (P28-6): each shim tile carries 2 MM2S + 2 S2MM
+# channels and npu2 has 8 shims -> the whole device can host at most 16
+# inbound + 16 outbound streams. One A + one C fifo per worker means
+# N=16 EXACTLY saturates the channel budget (SequentialPlacer: every
+# shim, both channels, both directions) and N=32 cannot place at all
+# (ValueError "no tile matching column 5" -- shims exhausted). It also
+# has no upside: N=8 already runs ~4.3 GB/s per channel = 33.8 GB/s
+# aggregate, consume-limited BELOW the ~55 GB/s DDR wall, so N=16 is the
+# width that reaches the wall (16 x 4.3 = 69 -> capped ~55). Reaching
+# N=32 would need link-split stream sharing -- same aggregate, pointless.
+@pytest.mark.parametrize("workers", [8, 16])
+def test_layerv2(aie_context, workers):
+    golden = generate_layerv2_reference(n=workers)
+    g = geom(workers)
+    out_rows = (g["N_QKV"] + g["N_CXN"]) * 16
 
-    operator = AIELayerV2(context=aie_context)
+    operator = AIELayerV2(cols=workers, context=aie_context)
 
     input_buffers = {
         "weights": torch.from_numpy(golden["weights"]),
@@ -360,21 +432,21 @@ def test_layerv2(aie_context):
         operator, input_buffers, output_buffers, rel_tol=0.08, abs_tol=0.8
     )
 
-    # xn1 rows (the +256..640 slice of each worker's 640-row drain)
-    # carry the hw-sigmoid deviation through the down partials — same
-    # phase-1 band as test_quad: rel 0.08 + abs 200 at term scale; the
-    # qkv rows stay strict (rms1 renormalization absorbs the common
-    # mode, measured <= 0.75 absolute in P19b).
+    # xn1 rows (the trailing rows slice of each worker's drain) carry the
+    # hw-sigmoid deviation through the down partials — same phase-1 band
+    # as test_quad: rel 0.08 + abs 200 at term scale; the qkv rows stay
+    # strict (rms1 renormalization absorbs the common mode, measured
+    # <= 0.75 absolute in P19b).
     LOOSE_REL, LOOSE_ABS = 0.08, 200.0
     if errors:
         act_bits = operator.read_buffer(
-            "output", (COLS * OUT_ROWS,), dtype=np.uint16
+            "output", (workers * out_rows,), dtype=np.uint16
         )
         exp_bits = golden["output"].view(torch.uint16).numpy()
         af, ef = _f32(act_bits), _f32(exp_bits)
         strict_fail = []
         for r in errors["output"]:
-            in_xn1 = (r % OUT_ROWS) >= 384
+            in_xn1 = (r % out_rows) >= g["qkv_rows"]
             if in_xn1 and abs(af[r] - ef[r]) <= max(LOOSE_REL * abs(ef[r]), LOOSE_ABS):
                 continue
             strict_fail.append(r)
@@ -382,7 +454,7 @@ def test_layerv2(aie_context):
 
     mb = (len(golden["weights"]) + 2 * len(golden["x"])) / 1e6
     print(
-        f"\n[layerv2 whole-layer] Latency (us): {latency_us:.1f}, "
+        f"\n[layerv2 whole-layer w{workers}] Latency (us): {latency_us:.1f}, "
         f"{mb / latency_us * 1e3:.2f} GB/s weights"
     )
 

@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""P28-3 probe: 8 persistent workers in a RING of core<->core ObjectFifos.
+"""P28-3/P28-6 probe: N persistent workers (8/16) in a RING of
+core<->core ObjectFifos.
 
 Layer-v2 (one task group per layer) needs cross-column redistribution
 (rms wants the full 2048-vector, swiglu the full 6144, rms1' the whole
@@ -45,13 +46,32 @@ from aie.iron import Kernel, ObjectFifo, Program, Runtime, Worker
 from aie.iron.placers import SequentialPlacer
 from aie.iron.device import NPU1, NPU2
 
+from iron.operators.w4gemvu.design_layerv2 import ring_tables
+
 CHUNK = 512  # bf16 elements per ring/fifo element (1 KiB, same as swiglu inter)
-SUCC = {0: 1, 1: 2, 2: 3, 3: 7, 7: 6, 6: 5, 5: 4, 4: 0}  # serpentine ring
-PRED = {v: k for k, v in SUCC.items()}
 
 
-def my_ring_probe(dev, cols=8, chunk=CHUNK):
-    assert cols == 8, "serpentine tables are for the 8-core npu2 partition"
+def succ_tables(cols):
+    """Ring successor tables -- serpentine N=8 / all-adjacent Hamiltonian
+    N=16 (CORE<->CORE OBJECTFIFO LAW; one source of truth in
+    design_layerv2.ring_tables, shared with the layerv2 design)."""
+    assert cols in (8, 16)
+    order, succ = ring_tables(cols)
+    pred = {v: k for k, v in succ.items()}
+    return succ, pred
+
+
+def my_ring_probe(dev, cols=8, chunk=CHUNK, laps=1):
+    """laps=1: the P28-3 single-lap probe (push own, receive pred's).
+    laps>1: the gather RELAY (P28-6) -- push own, then laps-1 receives
+    WITH forwarding (store-and-forward, exactly the layerv2 gather's
+    fifo pattern), the last received chunk going to the C drain. Pushes
+    per edge = laps = pulls per edge, so the ring drains between execs
+    for every laps. Pure ring_copy kernel: any hang is topology/relay,
+    not layerv2 data paths."""
+    assert cols in (8, 16), "ring tables exist for 8/16 workers"
+    assert laps >= 1
+    SUCC, PRED = succ_tables(cols)
 
     dtype = np.dtype[bfloat16]
 
@@ -74,6 +94,12 @@ def my_ring_probe(dev, cols=8, chunk=CHUNK):
     ]
 
     def core_body(a_fifo, rout_fifo, rin_fifo, c_fifo, fn):
+        from aie.helpers.dialects.scf import if_
+        from aie.extras.dialects.arith import cmpi, constant
+
+        def lt(i, n_):
+            return cmpi("slt", i, constant(n_, index=True))
+
         for _ in range_(0xFFFFFFFF):
             # 1) feed the ring FIRST: producer acquire only waits for a
             #    free buffer, so the first lap self-starts.
@@ -82,13 +108,26 @@ def my_ring_probe(dev, cols=8, chunk=CHUNK):
             fn(a, rout)
             rout_fifo.release(1)
             a_fifo.release(1)
-            # 2) consume what the predecessor sent THIS exec (the ring was
-            #    empty at the exec boundary) and parrot it to the drain.
-            rin = rin_fifo.acquire(1)
-            c = c_fifo.acquire(1)
-            fn(rin, c)
-            rin_fifo.release(1)
-            c_fifo.release(1)
+            # 2) the relay: laps receives; the first laps-1 are forwarded
+            # (store-and-forward, the layerv2 gather's exact fifo
+            # pattern), the LAST goes to the drain. Pushes per edge =
+            # 1 + (laps-1) = laps = pulls -- balanced for every laps,
+            # and laps=1 degenerates to the original single-lap probe.
+            for i in range_(48):
+                with if_(lt(i, laps), hasElse=False):
+                    rin = rin_fifo.acquire(1)
+                    with if_(lt(i, laps - 1), hasElse=False):
+                        rout = rout_fifo.acquire(1)
+                        fn(rin, rout)
+                        rout_fifo.release(1)
+                    with if_(
+                        cmpi("eq", i, constant(laps - 1, index=True)),
+                        hasElse=False,
+                    ):
+                        c = c_fifo.acquire(1)
+                        fn(rin, c)
+                        c_fifo.release(1)
+                    rin_fifo.release(1)
 
     workers = [
         Worker(
@@ -129,11 +168,12 @@ def my_ring_probe(dev, cols=8, chunk=CHUNK):
 
 
 if __name__ == "__main__":
-    argparser = argparse.ArgumentParser(prog="P28-3 ring probe")
+    argparser = argparse.ArgumentParser(prog="P28-3/P28-6 ring probe")
     argparser.add_argument("--dev", type=str, choices=["npu", "npu2"], default="npu")
     argparser.add_argument("--cols", type=int, default=8)
+    argparser.add_argument("--laps", type=int, default=1)
     argparser.add_argument("--output-file-path", "-o", type=str, required=True)
     args = argparser.parse_args()
-    module = my_ring_probe(args.dev, args.cols)
+    module = my_ring_probe(args.dev, args.cols, CHUNK, args.laps)
     with open(args.output_file_path, "w") as f:
         f.write(str(module))

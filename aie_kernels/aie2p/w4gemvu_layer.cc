@@ -56,13 +56,21 @@
 // kernels sharing one bin_name is the proven multi-Kernel pattern; the
 // Worker collects bin_names in a set so the single .o links once).
 //
-// Ring position arithmetic: the serpentine ring visits workers in the
-// order 0,1,2,3,7,6,5,4 (SUCC = {0:1,1:2,2:3,3:7,7:6,6:5,5:4,4:0}), so
-// worker w sits at ring position p = (w < 4) ? w : 11 - w. In round r
-// (r = 1..7) a worker receives the chunk that started at ring position
-// (p - r) & 7 — stored to slot (p - r) & 7 of the gather buffer, and
-// forwarded on rounds 1..6 only (round 7's chunk would return to its
-// origin). Worker w's global j-slices are defined by p, never by w.
+// Ring position arithmetic: every ring edge must join unit-step
+// neighbor tiles — core<->core objectFifos only lower to shared memory
+// between mem-affine tiles; anything farther splits into a core mem-DMA
+// MM2S channel and npu2 cores have just 2 output channels (the N=16
+// serpentine wrap (3,2)->(0,2) busted worker 12 with 3; see
+// design_layerv2.HAM16). N=8 keeps the two-column serpentine
+// (order 0,1,2,3,7,6,5,4): worker w at tile (col c = w>>2, row w&3),
+// p = w on even c and p = 8c + 3 - w on odd c. N=16 uses the
+// Hamiltonian cycle order 0,1,2,3,7,6,5,9,10,11,15,14,13,12,8,4 —
+// the piecewise inverse lives in lv_xelem. In round r (r = 1..N-1) a
+// worker receives the chunk that started at ring position
+// (p - r) & (N-1) — stored to slot (p - r) & (N-1) of the gather
+// buffer, and forwarded on rounds 1..N-2 only (the last round's chunk
+// would return to its origin). Worker w's global j-slices are defined
+// by p, never by w.
 //
 // NUMERICS: every rounding step mirrors the v5/fused golden chain
 // (P17/P19): x' = bf16(f32(x_n) + f32(o)) [fr1]; rms in f32 over the
@@ -87,22 +95,35 @@ constexpr uint32_t kTileRows = 16;
 constexpr uint32_t kTileK = 2048;
 constexpr uint32_t kGroups = kTileK / 32; // 64
 constexpr uint32_t kM1 = 2048;            // model hidden width
-constexpr uint32_t kRowsPerWorker = kM1 / 8;   // 256
-constexpr uint32_t kJPerWorker = 6144 / 8;     // 768 gate/up rows
-constexpr uint32_t kGrpPerWorker = kJPerWorker / 32; // 24
 
-// ---- .bss state block (per worker; 21184 B, arrays as raw bytes to
-// keep bfloat16 ctors out of the AIE's ctor-less startup) ----
+// ---- P28-6 ring widening: the worker count N is RUNTIME state, read
+// from the X element ([6404,6408) u32) at every exec boundary -- one .o
+// serves the 8/16/32-worker designs. Derived per-worker geometry (all
+// exact for power-of-2 N <= 128):
+//   rows = 2048/N residual rows   (N=8: 256, 16: 128, 32: 64)
+//   jpw  = 6144/N gate/up rows    (768 / 384 / 192, all multiples of 32)
+//   grp  = jpw/32 quant groups    (24 / 12 / 6)
+// The ring masks use & (N-1). lv_xn/lv_o/lv_dacc stay allocated at the
+// N=8 maximum (512/512/1024 B) -- smaller N just uses less of them.
+// The ring2 SCALE copies go through SCALAR u16 stores (lv_fr2/lv_st2):
+// the per-slot scale stride grp*2 is 48/24/12 B and only the 48B case is
+// 16B-aligned; the AIE ALIGNMENT LAW (P28-4) makes vector ops at
+// 16-mod-32 addresses undefined, and 24B would hit it on odd slots.
+
+// ---- .bss state block (per worker; arrays as raw bytes to keep
+// bfloat16 ctors out of the AIE's ctor-less startup). lv_xn/lv_o/lv_dacc
+// are sized for the N=8 MAXIMUM (256 rows); smaller N uses less of them. ----
+constexpr uint32_t kRowsMax = kM1 / 8; // 256
 static uint8_t lv_arena[kGroups * 128] __attribute__((aligned(64))); // 8192: replicated A-ops
 static uint8_t lv_sw[6144 + 384] __attribute__((aligned(64)));       // 6528: int8 q global-j + scales @6144
-static uint8_t lv_xn[kRowsPerWorker * 2] __attribute__((aligned(64))); // 512: 256 bf16
-static uint8_t lv_o[kRowsPerWorker * 2] __attribute__((aligned(64))); // 512: 256 bf16
-static float lv_dacc[kRowsPerWorker] __attribute__((aligned(64)));     // 1024: f32 down partials
-static uint8_t lv_shared[kM1 * 2] __attribute__((aligned(64)));        // 4096: 8 x 512B ring slots
-static uint8_t lv_dA[kGroups * 2] __attribute__((aligned(64)));        // 128: 64 bf16
-static uint8_t lv_temp[128] __attribute__((aligned(64)));              // per-group f32 staging
-static uint8_t lv_qscratch[128] __attribute__((aligned(64)));          // quant div lanes (PMEM law)
-static uint32_t lv_ctr[16] __attribute__((aligned(64)));
+static uint8_t lv_xn[kRowsMax * 2] __attribute__((aligned(64)));     // 512: rows bf16
+static uint8_t lv_o[kRowsMax * 2] __attribute__((aligned(64)));      // 512: rows bf16
+static float lv_dacc[kRowsMax] __attribute__((aligned(64)));         // 1024: f32 down partials
+static uint8_t lv_shared[kM1 * 2] __attribute__((aligned(64)));      // 4096: N ring slots (rows*2B each)
+static uint8_t lv_dA[kGroups * 2] __attribute__((aligned(64)));      // 128: 64 bf16
+static uint8_t lv_temp[128] __attribute__((aligned(64)));            // per-group f32 staging
+static uint8_t lv_qscratch[128] __attribute__((aligned(64)));        // quant div lanes (PMEM law)
+static uint32_t lv_ctr[20] __attribute__((aligned(64)));
 
 // Phase-overlaid windows INSIDE lv_shared (L1 law). After K=101's rms
 // consumes the gathered x', all 4096 B are dead until ring3 rewrites
@@ -131,8 +152,16 @@ constexpr uint32_t cR1 = 7;     // ring1 rounds received
 constexpr uint32_t cR2 = 8;     // ring2 rounds received
 constexpr uint32_t cR3 = 9;     // ring3 rounds received
 constexpr uint32_t cW = 10;     // worker id
-constexpr uint32_t cDown = 11;  // down element index (0..47)
+constexpr uint32_t cDown = 11;  // down element index (0..N_DOWN-1)
 constexpr uint32_t cP = 12;     // ring position
+// P28-6 runtime geometry (set by lv_xelem from the X element's N word):
+constexpr uint32_t cN = 13;     // worker count (8/16/32)
+constexpr uint32_t cRows = 14;  // 2048/N residual rows per worker
+constexpr uint32_t cGrp = 15;   // (6144/N)/32 quant groups per worker
+constexpr uint32_t cMask = 16;  // N-1 (ring slot mask; N power of 2)
+constexpr uint32_t cJpw = 17;   // 6144/N int8 q bytes per ring2 slot
+constexpr uint32_t cDMask = 18; // (rows/16)-1: down row-block-in-chunk mask
+constexpr uint32_t cR2E = 19;   // ring2 element bytes = jpw + align32(grp*2)
 
 // shared per-group helpers (P19 forms, cloned from w4gemvu.cc verbatim)
 static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp);
@@ -274,7 +303,11 @@ static void __attribute__((noinline)) lv_wgroup(const bfloat16 *__restrict h2g,
 
 // ---- K flavors ----
 
-// K=0 X element: stage attn operands + reset ALL per-exec state.
+// K=0 X element: stage attn operands + reset ALL per-exec state (incl.
+// the P28-6 runtime geometry). Generalized serpentine ring position:
+// worker w sits at tile (col c = w>>2, row w&3); even columns walk rows
+// ascending, odd columns descending, so p = w on even c and
+// p = 8c + 3 - w on odd c (N=8: p = (w<4)?w:11-w, the P28-3 form).
 static void __attribute__((noinline)) lv_xelem(const uint8_t *__restrict a_in)
 {
     lv_build_arena(reinterpret_cast<const int8_t *__restrict>(a_in));
@@ -285,15 +318,64 @@ static void __attribute__((noinline)) lv_xelem(const uint8_t *__restrict a_in)
         reinterpret_cast<uint32_t *__restrict>(lv_dA);
     for (uint32_t i = 0; i < d_words; i++)
         dd[i] = ds[i];
+    const uint32_t w = *(const uint32_t *__restrict)(a_in + 6400);
+    // N at [6404,6408). Only 16/32 change the geometry; anything else
+    // (incl. the legacy all-zero X the old builders produced) is N=8.
+    uint32_t n = *(const uint32_t *__restrict)(a_in + 6404);
+    if (n != 16 && n != 32)
+        n = 8;
+    const uint32_t n0 = n; // the shift loop below consumes n — keep the
+                           // original for the ring mask (P28-6 near-miss:
+                           // storing the post-shift n made cMask always 7)
+    // rows = 2048/N without a __ctzsi2 call: seed at the N=8 value
+    // (kRowsMax) and halve once per halving of n past 8. Seeding at kM1
+    // was the P28-6 board hang: N=8 never entered the loop, rows stayed
+    // 2048, and the dacc-zero loop wrote 8KB over lv_shared/lv_dA/lv_ctr
+    // — the zeroed cRows/cMask then skipped every ring loop and the
+    // workers deadlocked on fifo acquire (ERT_CMD_STATE_TIMEOUT).
+    uint32_t rows = kRowsMax; // 256
+    while (n > 8) {
+        n >>= 1;
+        rows >>= 1;
+    }
+    const uint32_t jpw = rows * 3;   // 6144/N (6144 = 3*2048)
+    const uint32_t grp = jpw >> 5;
+    lv_ctr[cN] = n0;
+    lv_ctr[cRows] = rows;
+    lv_ctr[cGrp] = grp;
+    lv_ctr[cMask] = n0 - 1;
+    lv_ctr[cJpw] = jpw;
+    lv_ctr[cDMask] = (rows >> 4) - 1;
+    lv_ctr[cR2E] = jpw + ((grp * 2 + 31) & ~31u);
     // zero the f32 down accumulators once per exec (first partial += )
     uint32_t *__restrict da =
         reinterpret_cast<uint32_t *__restrict>(lv_dacc);
 #pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < kRowsPerWorker; i++)
+    for (uint32_t i = 0; i < rows; i++)
         da[i] = 0;
-    const uint32_t w = *(const uint32_t *__restrict)(a_in + 6400);
+    const uint32_t col = w >> 2;
     lv_ctr[cW] = w;
-    lv_ctr[cP] = (w < 4) ? w : 11 - w;
+    // Ring position. N=8: the two-column serpentine (p = w on even
+    // columns, 8c+3-w on odd ones). N=16: the all-adjacent Hamiltonian
+    // cycle (CORE<->CORE OBJECTFIFO LAW, P28-6 -- non-adjacent
+    // core<->core edges split into a core mem-DMA MM2S channel and npu2
+    // cores have only 2 output channels; the serpentine wrap (3,2)->
+    // (0,2) needed 3 on worker 12). Cycle order 0,1,2,3,7,6,5,9,10,11,
+    // 15,14,13,12,8,4 (design_layerv2.HAM16) has no closed-form inverse,
+    // so the position rides this piecewise arithmetic (mirrored by the
+    // packer/golden pos()): col 0 = r, col 3 = 13-r, col 1/2 bottom
+    // worker = 15/14, else col 1 = 7-r, col 2 = 6+r.
+    uint32_t p;
+    if (n0 != 16) {
+        p = (col & 1) ? (8 * col + 3 - w) : w;
+    } else {
+        const uint32_t r = w & 3;
+        p = (col == 0) ? r
+          : (col == 3) ? (13 - r)
+          : (r == 0) ? ((col == 1) ? 15 : 14)
+          : ((col == 1) ? (7 - r) : (6 + r));
+    }
+    lv_ctr[cP] = p;
     lv_ctr[cO] = 0;
     lv_ctr[cGate] = 0;
     lv_ctr[cUpG] = 0;
@@ -307,15 +389,16 @@ static void __attribute__((noinline)) lv_xelem(const uint8_t *__restrict a_in)
     lv_ctr[cR3] = 0;
 }
 
-// K=100 xn element: this worker's x_n chunk (256 bf16).
+// K=100 xn element: this worker's x_n chunk (rows bf16).
 static void __attribute__((noinline)) lv_xnelem(const uint8_t *__restrict a_in)
 {
     const uint16_t *__restrict src =
         reinterpret_cast<const uint16_t *__restrict>(a_in);
     uint16_t *__restrict dst =
         reinterpret_cast<uint16_t *__restrict>(lv_xn);
+    const uint32_t rows = lv_ctr[cRows];
 #pragma clang loop unroll(disable)
-    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+    for (uint32_t r = 0; r < rows; r += 16)
         aie::store_v(dst + r, aie::load_v<16>(src + r));
 }
 
@@ -399,7 +482,7 @@ static void __attribute__((noinline)) lv_downelem(const uint8_t *__restrict a_in
                reinterpret_cast<const bfloat16 *__restrict>(lv_sw + 6144 +
                                                             c * 128),
                part);
-    float *__restrict dp = lv_dacc + (lv_ctr[cDown] & 15) * 16;
+    float *__restrict dp = lv_dacc + (lv_ctr[cDown] & lv_ctr[cDMask]) * 16;
     const uint16_t *__restrict pu =
         reinterpret_cast<const uint16_t *__restrict>(part);
 #pragma clang loop unroll(disable)
@@ -568,7 +651,7 @@ static void __attribute__((noinline)) lv_upelem(const uint8_t *__restrict a_in)
                reinterpret_cast<const int8_t *__restrict>(lv_arena),
                reinterpret_cast<const bfloat16 *__restrict>(lv_dA), dst);
     if (lv_ctr[cUpH] == 1) {
-        const uint32_t g = lv_ctr[cP] * kGrpPerWorker + lv_ctr[cUpG];
+        const uint32_t g = lv_ctr[cP] * lv_ctr[cGrp] + lv_ctr[cUpG];
         float *__restrict temp =
             reinterpret_cast<float *__restrict>(lv_temp);
         fused_sw_sig(reinterpret_cast<const bfloat16 *__restrict>(lv_gate) +
@@ -658,15 +741,16 @@ void lv_fr1(uint8_t *__restrict ob)
         aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
     const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
     const uint32_t p = lv_ctr[cP];
+    const uint32_t rows = lv_ctr[cRows];
     const bfloat16 *__restrict xn =
         reinterpret_cast<const bfloat16 *__restrict>(lv_xn);
     const bfloat16 *__restrict oo =
         reinterpret_cast<const bfloat16 *__restrict>(lv_o);
     bfloat16 *__restrict sh =
-        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * 256;
+        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * rows;
     bfloat16 *__restrict dst = reinterpret_cast<bfloat16 *__restrict>(ob);
 #pragma clang loop unroll(disable)
-    for (uint32_t g = 0; g < kRowsPerWorker / 32; g++) {
+    for (uint32_t g = 0; g < rows / 32; g++) {
         aie::accum<accfloat, 32> a =
             aie::mul(aie::load_v<32>(xn + g * 32), ones_bf);
         a = aie::mac(a, ones_f,
@@ -679,7 +763,7 @@ void lv_fr1(uint8_t *__restrict ob)
     lv_ctr[cR1] = 1;
 }
 
-// ring1 forward (512B) — also ring3's forward (same r13 fifo, same
+// ring1 forward (rows*2B) — also ring3's forward (same r13 fifo, same
 // element size).
 void lv_fw1(const uint8_t *__restrict s, uint8_t *__restrict ob)
 {
@@ -687,81 +771,88 @@ void lv_fw1(const uint8_t *__restrict s, uint8_t *__restrict ob)
         reinterpret_cast<const uint16_t *__restrict>(s);
     uint16_t *__restrict dst =
         reinterpret_cast<uint16_t *__restrict>(ob);
+    const uint32_t rows = lv_ctr[cRows];
 #pragma clang loop unroll(disable)
-    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+    for (uint32_t r = 0; r < rows; r += 16)
         aie::store_v(dst + r, aie::load_v<16>(src + r));
 }
 
-// ring1 store: slot (p - r1r) & 7 of lv_shared.
+// ring1 store: slot (p - r1r) & (N-1) of lv_shared.
 void lv_st1(const uint8_t *__restrict s)
 {
-    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR1]) & 7;
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR1]) & lv_ctr[cMask];
+    const uint32_t rows = lv_ctr[cRows];
     const uint16_t *__restrict src =
         reinterpret_cast<const uint16_t *__restrict>(s);
     uint16_t *__restrict dst =
-        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * 256;
+        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * rows;
 #pragma clang loop unroll(disable)
-    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+    for (uint32_t r = 0; r < rows; r += 16)
         aie::store_v(dst + r, aie::load_v<16>(src + r));
     lv_ctr[cR1]++;
 }
 
-// ring2 make: own 768 int8 q + 48B of scales -> 832B element.
+// ring2 make: own jpw int8 q + grp u16 scales -> R2B element (q region
+// and every 32B boundary stay aligned; the trailing pad is left stale).
 void lv_fr2(uint8_t *__restrict ob)
 {
     const uint32_t p = lv_ctr[cP];
-    const uint8_t *__restrict q = lv_sw + p * 768;
+    const uint32_t jpw = lv_ctr[cJpw];
+    const uint8_t *__restrict q = lv_sw + p * jpw;
 #pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < 768; i += 32) {
+    for (uint32_t i = 0; i < jpw; i += 32) {
         const auto v = aie::load_v<32>(q + i);
         aie::store_v(ob + i, v);
     }
-    // AIE ALIGNMENT LAW (P28-4 root cause): a 32B vector op at a
-    // 16-mod-32 address is undefined on AIE2 -- the [ptr, stream-off]
-    // hardware form truncates to its natural 32B boundary, so the 48B
-    // per-position scale stride scrambled every odd position (slot
-    // (p+1) k16-23 clobbered, odd slot k8-15 never written). 16B ops at
-    // 48p + {0,16,32} are all 16B-aligned (48p = 0 mod 16); the 16B
-    // form was already proven by the old tail op surviving clean.
+    // AIE ALIGNMENT LAW (P28-4): the per-position scale stride is
+    // grp*2 = 48/24/12B for N=8/16/32 and only 48B is even 16B-aligned,
+    // so the P28-4 three-16B-op fix does not generalize. SCALAR u16
+    // copies have no alignment constraint -- grp (6-24) iterations of
+    // a rolled loop, invisible next to the jpw-byte q copy.
+    const uint32_t grp = lv_ctr[cGrp];
     const uint16_t *__restrict sc =
-        reinterpret_cast<const uint16_t *__restrict>(lv_sw + 6144 + p * 48);
+        reinterpret_cast<const uint16_t *__restrict>(lv_sw + 6144 +
+                                                     p * grp * 2);
     uint16_t *__restrict d2 =
-        reinterpret_cast<uint16_t *__restrict>(ob + 768);
-    aie::store_v(d2, aie::load_v<8>(sc));
-    aie::store_v(d2 + 8, aie::load_v<8>(sc + 8));
-    aie::store_v(d2 + 16, aie::load_v<8>(sc + 16));
+        reinterpret_cast<uint16_t *__restrict>(ob + jpw);
+#pragma clang loop unroll(disable)
+    for (uint32_t k = 0; k < grp; k++)
+        d2[k] = sc[k];
     lv_ctr[cR2] = 1;
 }
 
-// ring2 forward: EXACTLY 832B = 26 x 32B chunks — never overrun into
-// the adjacent depth-2 fifo buffer.
+// ring2 forward: EXACTLY cR2E bytes in 32B chunks — never overrun into
+// the adjacent depth-2 fifo buffer (element size is a multiple of 32).
 void lv_fw2(const uint8_t *__restrict s, uint8_t *__restrict ob)
 {
+    const uint32_t r2e = lv_ctr[cR2E];
 #pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < 832; i += 32) {
+    for (uint32_t i = 0; i < r2e; i += 32) {
         const auto v = aie::load_v<32>(s + i);
         aie::store_v(ob + i, v);
     }
 }
 
-// ring2 store: int8 -> slot*768, scales -> 6144 + slot*48.
+// ring2 store: int8 -> slot*jpw, scales -> 6144 + slot*grp*2.
 void lv_st2(const uint8_t *__restrict s)
 {
-    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR2]) & 7;
-    uint8_t *__restrict q = lv_sw + slot * 768;
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR2]) & lv_ctr[cMask];
+    const uint32_t jpw = lv_ctr[cJpw];
+    uint8_t *__restrict q = lv_sw + slot * jpw;
 #pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < 768; i += 32) {
+    for (uint32_t i = 0; i < jpw; i += 32) {
         const auto v = aie::load_v<32>(s + i);
         aie::store_v(q + i, v);
     }
-    // Same alignment law as lv_fr2: three 16B ops, all 16B-aligned.
+    // Scalar scale copies — same alignment reasoning as lv_fr2.
+    const uint32_t grp = lv_ctr[cGrp];
     const uint16_t *__restrict sc =
-        reinterpret_cast<const uint16_t *__restrict>(s + 768);
+        reinterpret_cast<const uint16_t *__restrict>(s + jpw);
     uint16_t *__restrict d2 =
-        reinterpret_cast<uint16_t *__restrict>(lv_sw + 6144 + slot * 48);
-    aie::store_v(d2, aie::load_v<8>(sc));
-    aie::store_v(d2 + 8, aie::load_v<8>(sc + 8));
-    aie::store_v(d2 + 16, aie::load_v<8>(sc + 16));
+        reinterpret_cast<uint16_t *__restrict>(lv_sw + 6144 + slot * grp * 2);
+#pragma clang loop unroll(disable)
+    for (uint32_t k = 0; k < grp; k++)
+        d2[k] = sc[k];
     lv_ctr[cR2]++;
 }
 
@@ -778,16 +869,17 @@ void lv_fr3(uint8_t *__restrict ob)
     const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
     const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
     const uint32_t p = lv_ctr[cP];
+    const uint32_t rows = lv_ctr[cRows];
     const bfloat16 *__restrict xn =
         reinterpret_cast<const bfloat16 *__restrict>(lv_xn);
     const bfloat16 *__restrict oo =
         reinterpret_cast<const bfloat16 *__restrict>(lv_o);
     bfloat16 *__restrict sh =
-        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * 256;
+        reinterpret_cast<bfloat16 *__restrict>(lv_shared) + p * rows;
     const float *__restrict da = lv_dacc;
     bfloat16 *__restrict dst = reinterpret_cast<bfloat16 *__restrict>(ob);
 #pragma clang loop unroll(disable)
-    for (uint32_t g = 0; g < kRowsPerWorker / 32; g++) {
+    for (uint32_t g = 0; g < rows / 32; g++) {
         aie::accum<accfloat, 32> a =
             aie::mul(aie::load_v<32>(xn + g * 32), ones_bf);
         a = aie::mac(a, ones_f,
@@ -807,13 +899,14 @@ void lv_fr3(uint8_t *__restrict ob)
 // ring3 store: overwrite slot's x' with xn1.
 void lv_st3(const uint8_t *__restrict s)
 {
-    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR3]) & 7;
+    const uint32_t slot = (lv_ctr[cP] - lv_ctr[cR3]) & lv_ctr[cMask];
+    const uint32_t rows = lv_ctr[cRows];
     const uint16_t *__restrict src =
         reinterpret_cast<const uint16_t *__restrict>(s);
     uint16_t *__restrict dst =
-        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * 256;
+        reinterpret_cast<uint16_t *__restrict>(lv_shared) + slot * rows;
 #pragma clang loop unroll(disable)
-    for (uint32_t r = 0; r < kRowsPerWorker; r += 16)
+    for (uint32_t r = 0; r < rows; r += 16)
         aie::store_v(dst + r, aie::load_v<16>(src + r));
     lv_ctr[cR3]++;
 }
@@ -825,9 +918,77 @@ void lv_cxn(uint8_t *__restrict c)
     const uint32_t i = lv_ctr[cXnI]++;
     const uint32_t p = lv_ctr[cP];
     const uint16_t *__restrict src =
-        reinterpret_cast<const uint16_t *__restrict>(lv_shared) + p * 256 + i * 16;
+        reinterpret_cast<const uint16_t *__restrict>(lv_shared) +
+        p * lv_ctr[cRows] + i * 16;
     aie::store_v(reinterpret_cast<uint16_t *__restrict>(c),
                  aie::load_v<16>(src));
+}
+
+// P28-6 discriminator kernels (dumb-gather probe, design_lv2probe
+// rings=11): the r13 gather relay with ALL computation removed -- same
+// ObjectFifo acquire/release/forward structure as lv_fr1/lv_fw1/lv_st1,
+// dumb bodies. Board-pass => lv_* kernel N=16 data path guilty; hang =>
+// fill dispatch/ordering guilty (perf-lab 6f-2). 128 = rows at N=16.
+void ring_touch1(uint16_t *__restrict dst)
+{
+    // read-back write-back: a pure slot touch, same store_v/load_v forms
+    // as lv_cxn (no zeros<> overload games).
+    ::aie::store_v(dst, ::aie::load_v<16>(dst));
+}
+
+void ring_copy128_bf16(const uint16_t *__restrict src,
+                       uint16_t *__restrict dst)
+{
+    for (uint32_t i = 0; i < 128; i += 16) {
+        ::aie::store_v(dst + i, aie::load_v<16>(src + i));
+    }
+}
+
+// rings=15 probe: copy128 padded with a spin matching lv_fw1's
+// rolled-loop latency -- same timing signature, none of its codegen
+// (no lv_ctr read, no memory-trip ZOL). Hang => the N=16 relay deadlock
+// is a TIMING RACE in the fifo/lock protocol; pass => lv_fw1's codegen.
+static volatile uint32_t lv_probe_spin;
+
+void ring_copy128_slow(const uint16_t *__restrict src,
+                       uint16_t *__restrict dst)
+{
+    uint32_t acc = 0;
+#pragma clang loop unroll(disable)
+    for (uint32_t j = 0; j < 64; j++)
+        acc ^= j;
+    lv_probe_spin = acc;
+    for (uint32_t i = 0; i < 128; i += 16) {
+        ::aie::store_v(dst + i, aie::load_v<16>(src + i));
+    }
+}
+
+// rings=16 probe: lv_fw1's body VERBATIM under a different symbol --
+// separates body-content (hangs) from symbol/placement (passes).
+void lv_fw1_clone(const uint8_t *__restrict s, uint8_t *__restrict ob)
+{
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(s);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(ob);
+    const uint32_t rows = lv_ctr[cRows];
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < rows; r += 16)
+        ::aie::store_v(dst + r, ::aie::load_v<16>(src + r));
+}
+
+// rings=17 probe: lv_fw1's body with a compile-time 128 bound (no
+// lv_ctr read, no memory-trip ZOL) -- pass => the memory-loaded trip
+// count is the culprit; N=16-only by construction.
+void ring_fw_const(const uint8_t *__restrict s, uint8_t *__restrict ob)
+{
+    const uint16_t *__restrict src =
+        reinterpret_cast<const uint16_t *__restrict>(s);
+    uint16_t *__restrict dst =
+        reinterpret_cast<uint16_t *__restrict>(ob);
+#pragma clang loop unroll(disable)
+    for (uint32_t r = 0; r < 128; r += 16)
+        ::aie::store_v(dst + r, ::aie::load_v<16>(src + r));
 }
 
 } // extern "C"
