@@ -124,6 +124,10 @@ static uint8_t lv_dA[kGroups * 2] __attribute__((aligned(64)));      // 128: 64 
 static uint8_t lv_temp[128] __attribute__((aligned(64)));            // per-group f32 staging
 static uint8_t lv_qscratch[128] __attribute__((aligned(64)));        // quant div lanes (PMEM law)
 static uint8_t lv_ctr[24] __attribute__((aligned(64)));
+// P28-12 bisect: online-softmax m/l state moved OFF the lv_sw overlay
+// to a dedicated array — board instrumentation showed reads returning
+// the init values every step (l stuck at 1) with the overlay address.
+static float lv_attn_mls[8] __attribute__((aligned(64)));
 
 // Phase-overlaid windows INSIDE lv_shared (L1 law). After K=101's rms
 // consumes the gathered x', all 4096 B are dead until ring3 rewrites
@@ -149,7 +153,7 @@ static uint8_t lv_ctr[24] __attribute__((aligned(64)));
 // norm weights are consumed at init, before any output is produced).
 #define lv_attn_q (lv_sw)                // 2 heads x 128 bf16 (512B)
 #define lv_attn_acc (lv_sw + 512)        // 2 heads x 128 f32 (1024B)
-#define lv_attn_ml (lv_sw + 1536)        // m0,m1,l0,l1 f32 (16B)
+// ml state now lives in lv_attn_mls (dedicated .bss)
 #define lv_attn_kv (lv_sw + 1560)        // staged k_cur,v_cur bf16 x128
 #define lv_attn_cs (lv_shared)           // cos 128 f32 | sin 128 f32
 #define lv_attn_nw (lv_shared + 1024)    // qn 128 bf16 | kn 128 bf16
@@ -181,7 +185,9 @@ constexpr uint32_t cR2E = 19;   // ring2 element bytes = jpw + align32(grp*2)
 constexpr uint32_t cAttnS = 20; // total attended positions incl current
 constexpr uint32_t cAttnJ = 21; // kvhist elements consumed
 constexpr uint32_t cAttnO = 22; // output 16-row pieces emitted (0..15)
-static volatile uint32_t khist_probe_nop; // bisect: 1 = skip attn_step
+constexpr uint32_t cAttnDbg = 23; // S word bit 31 (lv_ctr is BYTES — a
+                                  // u32 store truncates and the debug bit
+                                  // never landed; keep it its own byte)
 
 // shared per-group helpers (P19 forms, cloned from w4gemvu.cc verbatim)
 static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp);
@@ -758,7 +764,7 @@ static void __attribute__((noinline)) attn_rope(const bfloat16 *__restrict x,
         const aie::vector<float, 32> hi =
             aie::mul(aie::load_v<32>(x + 64 + i), ones_bf).to_vector<float>();
         const aie::vector<float, 32> c = aie::load_v<32>(cs + i);
-        const aie::vector<float, 32> s = aie::load_v<32>(cs + 128 + i);
+        const aie::vector<float, 32> s = aie::load_v<32>(cs + 64 + i);
         const aie::vector<float, 32> v_lo =
             aie::sub(aie::mul(lo, c).to_vector<float>(),
                      aie::mul(hi, s).to_vector<float>());
@@ -888,13 +894,12 @@ static void __attribute__((noinline)) attn_step(const bfloat16 *__restrict k_j,
                                                 const bfloat16 *__restrict v_j)
 {
     float *__restrict temp = reinterpret_cast<float *__restrict>(lv_temp);
-    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_mls);
 #pragma clang loop unroll(disable)
     for (uint32_t h = 0; h < 2; h++) {
         const bfloat16 *__restrict qh =
             reinterpret_cast<const bfloat16 *__restrict>(lv_attn_q) + h * 128;
         const float s = attn_dot(qh, k_j);
-        if (s != s) return; // BISECT: stop after dot+div
         const float m_old = ml[h];
         const float m_new = s > m_old ? s : m_old;
         // EXP2 DOMAIN LAW: aie::exp2 traps/stalls on huge-negative args
@@ -923,6 +928,13 @@ static void __attribute__((noinline)) attn_step(const bfloat16 *__restrict k_j,
         attn_acc_update(
             reinterpret_cast<float *__restrict>(lv_attn_acc) + h * 128,
             v_j, alpha, e);
+        if (h == 0) {
+            // TRAJECTORY INSTR: head-1 rows carry per-step l/m snapshots
+            uint16_t *ob = reinterpret_cast<uint16_t *__restrict>(lv_attn_out);
+            uint32_t j = lv_ctr[cAttnJ] & 63u;
+            ob[128 + j] = fused_f32_to_bf16(ml[2]);
+            ob[192 + j] = fused_f32_to_bf16(ml[0]);
+        }
     }
 }
 
@@ -937,7 +949,10 @@ static void __attribute__((noinline)) lv_attninit(const uint8_t *__restrict a_in
     // here, once.
     ::aie::set_rounding(aie::rounding_mode::conv_even);
     const uint32_t p = lv_ctr[cP];
-    lv_ctr[cAttnS] = *(const uint32_t *__restrict)(a_in + 8704);
+    lv_ctr[cAttnS] =
+        (uint8_t)(*(const uint32_t *__restrict)(a_in + 8704) & 0xFFu);
+    lv_ctr[cAttnDbg] =
+        (uint8_t)((*(const uint32_t *__restrict)(a_in + 8704) >> 31) & 1u);
     lv_ctr[cAttnJ] = 0;
     lv_ctr[cAttnO] = 0;
     const uint32_t *__restrict cs32 =
@@ -945,8 +960,8 @@ static void __attribute__((noinline)) lv_attninit(const uint8_t *__restrict a_in
     uint32_t *__restrict cd32 =
         reinterpret_cast<uint32_t *__restrict>(lv_attn_cs);
 #pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < 256; i++)
-        cd32[i] = cs32[i]; // cos 128 f32 | sin 128 f32
+    for (uint32_t i = 0; i < 128; i++)
+        cd32[i] = cs32[i]; // cos 64 f32 | sin 64 f32, contiguous
     const bfloat16 *__restrict src =
         reinterpret_cast<const bfloat16 *__restrict>(a_in);
     bfloat16 *__restrict nw =
@@ -972,7 +987,7 @@ static void __attribute__((noinline)) lv_attninit(const uint8_t *__restrict a_in
     for (uint32_t i = 0; i < 128; i += 16)
         aie::store_v(kvs + 128 + i,
                      aie::load_v<16>(src + 2560 + kvh * 128 + i)); // v_cur
-    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_mls);
     float *__restrict accp = reinterpret_cast<float *__restrict>(lv_attn_acc);
 #pragma clang loop unroll(disable)
     for (uint32_t i = 0; i < 4; i++)
@@ -1002,7 +1017,7 @@ static void __attribute__((noinline)) lv_attnout(bfloat16 *__restrict c_out)
         reinterpret_cast<const bfloat16 *__restrict>(lv_attn_kv);
     if (lv_ctr[cAttnO] == 0) {
         attn_step(kvs, kvs + 128); // current position = last entry
-        float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+        float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_mls);
             aie::store_v(reinterpret_cast<float *__restrict>(lv_temp),
                      aie::div(aie::broadcast<float, 32>(1.0f),
                               aie::broadcast<float, 32>(ml[2]))
@@ -1029,13 +1044,24 @@ static void __attribute__((noinline)) lv_attnout(bfloat16 *__restrict c_out)
                              aie::mul(af, inv_v).to_vector<bfloat16>());
             }
         }
+        // BISECT instrumentation: row 240 = l (head 0), row 241 = hist
+        // elements consumed — reads out via the C drain.
+        uint16_t *ob = reinterpret_cast<uint16_t *__restrict>(lv_attn_out);
+        ob[240] = fused_f32_to_bf16(ml[2]);
+        ob[241] = fused_f32_to_bf16((float)lv_ctr[cAttnJ]);
+        const float *csp = reinterpret_cast<const float *__restrict>(lv_attn_cs);
+        ob[248] = fused_f32_to_bf16(csp[0]);   // cos[0] (~-0.99)
+        ob[249] = fused_f32_to_bf16(csp[32]);  // cos[32]
+        ob[250] = fused_f32_to_bf16(csp[64]);  // sin[0] (~0.13)
+        ob[252] = reinterpret_cast<const uint16_t *__restrict>(lv_attn_q)[0];
+        ob[253] = reinterpret_cast<const uint16_t *__restrict>(lv_attn_q)[1];
     }
     const uint32_t o = lv_ctr[cAttnO]++;
     // DEBUG MODE (S word bit 31): the 16 C elements stream the POST-
     // rope/qknorm q rows (256 bf16) instead of the attention output —
     // segment-by-segment bring-up.
     const bfloat16 *__restrict out =
-        (lv_ctr[cAttnS] & 0x80000000u)
+        lv_ctr[cAttnDbg]
             ? reinterpret_cast<const bfloat16 *__restrict>(lv_attn_q)
             : reinterpret_cast<const bfloat16 *__restrict>(lv_attn_out);
     aie::store_v(c_out, aie::load_v<16>(out + o * 16));

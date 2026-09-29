@@ -159,7 +159,7 @@ def build_w_stream(rng, S, parts):
         put(w, 1, 4096, k_all)
         put(w, 1, 5120, v_all)
         putf(w, 1, 6144, cos)
-        putf(w, 1, 7168, sin)
+        putf(w, 1, 6400, sin)
         put(w, 1, 8192, qn)
         put(w, 1, 8448, kn)
         u32(w, 1, 8704, S | 0x80000000 if DBG else S)
@@ -239,7 +239,7 @@ class AIELv2Attn(AIEOperatorBase):
 def test_lv2attn(S, aie_context):
     print(f"\nlv2attn: S={S} (GQA 16Q/4KV d=128, online softmax on NPU)")
     global DBG
-    DBG = True
+    DBG = False
     rng = np.random.default_rng(42)
     parts = golden_attention(rng, S)
     W = build_w_stream(rng, S, parts)
@@ -262,14 +262,7 @@ def test_lv2attn(S, aie_context):
                 ms = np.float32(ms + np.float32(t * t))
             out[h] = v * np.float32(1.0) / np.sqrt(np.float32(ms / HEAD_DIM + EPS)) * w
         return _bf16(out).reshape(-1)
-    qr = qknorm(rope(q), qn)
-    img = np.zeros(8 * 256, dtype=np.uint16)
-    for w in range(8):
-        pp = pos_of(w)
-        img[w * 256:(w + 1) * 256] = np.concatenate(
-            [qr[2 * pp * HEAD_DIM:(2 * pp + 1) * HEAD_DIM],
-             qr[(2 * pp + 1) * HEAD_DIM:(2 * pp + 2) * HEAD_DIM]])
-    golden = img
+    golden = parts[-1]  # full attention output per worker
 
     operator = AIELv2Attn(khist=S - 1, context=aie_context)
     input_buffers = {"weights": torch.from_numpy(W)}
@@ -281,7 +274,24 @@ def test_lv2attn(S, aie_context):
         operator, input_buffers, output_buffers, rel_tol=4.0e-2, abs_tol=1.5e-1
     )
     n = len(golden)
-    bad = len(errors["output"])
+    bad = len(errors.get("output", []))
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"({bad} errors out of {n} values)")
+    import struct
+
+    raw = operator.read_buffer("output", (8 * 256,), dtype=np.uint16)
+
+    def _bf(v):
+        return struct.unpack("<f", struct.pack("<I", int(v) << 16))[0]
+
+    print(
+        f"INSTR w0: l(h0)={_bf(raw[240]):.4f} J={_bf(raw[241]):.1f} "
+        f"q0..3={_bf(raw[0]):.4f},{_bf(raw[1]):.4f},{_bf(raw[2]):.4f},{_bf(raw[3]):.4f}"
+    )
+    print(
+        f"CSTAB cos0={_bf(raw[248]):.4f} cos32={_bf(raw[249]):.4f} "
+        f"sin0={_bf(raw[250]):.4f} q0={_bf(raw[252]):.4f}"
+    )
+    print("TRAJ l:", [round(_bf(raw[128 + k]), 3) for k in range(0, 48, 4)])
+    print("TRAJ m:", [round(_bf(raw[192 + k]), 3) for k in range(0, 48, 4)])
     assert bad <= int(n * 0.005), f"test failed with {bad}/{n}"
