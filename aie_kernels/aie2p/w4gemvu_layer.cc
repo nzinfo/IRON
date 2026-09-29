@@ -483,6 +483,12 @@ static void __attribute__((noinline)) lv_downelem(const uint8_t *__restrict a_in
                                                             c * 128),
                part);
     float *__restrict dp = lv_dacc + (lv_ctr[cDown] & lv_ctr[cDMask]) * 16;
+    // SCALAR accumulate (P28-7 bisect verdict): both vector forms tried
+    // so far are wrong on board -- plain aie::add lowers to a bare vadd.f
+    // (single mismatch), and the mul->mac(acc,ones,v) form corrupts
+    // wholesale. The scalar loop stays until a unit-tested vector form
+    // exists; the accumulator-domain float semantics have sharp edges
+    // (P17's "bare acc+acc illegal" was a warning).
     const uint16_t *__restrict pu =
         reinterpret_cast<const uint16_t *__restrict>(part);
 #pragma clang loop unroll(disable)
@@ -539,19 +545,27 @@ static void __attribute__((noinline)) fused_sw_sig(const bfloat16 *__restrict gp
     aie::store_v(temp, aie::mul(swb, ones_bf).to_vector<float>());
 }
 
-// integer amax of the staged sw — ROLLED (PMEM law).
+// integer amax of the staged sw — P28-7 vector form. The scalar loop
+// compares MASKED BITS (bits & 0x7fffffff) as integers; float is
+// sign-magnitude, and the mask flip is exactly a wraparound add of
+// INT_MIN: signed lanes become [b (positives) | (b+2^31)&mask
+// (negatives)] -- so the pair (reduce_max(t), reduce_max(t+INT_MIN))
+// always contains the masked-bit max, and their scalar max IS it.
+// Proof-checked in numpy over 200k random + adversarial patterns
+// (denormals, +-0, NaN payloads, +-inf, all-zero groups): 0 mismatches.
+// (The obvious max(b, -b) is WRONG -- -signed(b) is the two's-complement
+// 2^31-m, not the sign-magnitude m; that form was the first board try
+// and failed 10/10.) vadd.32 + vmax-tree are real vector ops; the
+// aie::abs/bit_and routes scalarize on 32b lanes.
 static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp)
 {
-    const uint32_t *__restrict tb =
-        reinterpret_cast<const uint32_t *__restrict>(temp);
-    uint32_t m = 0;
-#pragma clang loop unroll(disable)
-    for (uint32_t j = 0; j < 32; j++) {
-        const uint32_t a = tb[j] & 0x7fffffffu;
-        if (a > m)
-            m = a;
-    }
-    return m;
+    const aie::vector<int32_t, 32> t = aie::load_v<32>(
+        reinterpret_cast<const int32_t *__restrict>(temp));
+    const aie::vector<int32_t, 32> t2 =
+        aie::add(t, aie::broadcast<int32_t, 32>((int32_t)0x80000000));
+    const int32_t m1 = aie::reduce_max(t);
+    const int32_t m2 = aie::reduce_max(t2);
+    return (uint32_t)(m1 > m2 ? m1 : m2);
 }
 
 // d + invd + the RNE magic add, one group (v24e form: broadcasts at
@@ -598,47 +612,64 @@ static void __attribute__((noinline)) fused_sw_quant(uint32_t m_bits,
 }
 
 // q extraction (round-then-clip) + the replicated A-operand store
-// (P19 strided rolled form) — used by the rms pipeline (K=101/102).
+// (P19 strided form) — used by the rms pipeline (K=101/102).
+// P28-7 final vector form. Every op class here is individually
+// board-proven: the double-pack narrowing (lv_sw_x32, bisect round 5),
+// the 32B int8 store (same), and the load_v<16>(+16)/concat/32B-store
+// replication is lv_build_arena's exact body (P19, board-proven) --
+// hand-inlined with a dst parameter because that kernel writes a
+// fixed base. Rounds 4/6 failed on the UNPROVEN classes: 64B concat
+// stores, and 16B stores at 16-mod-32 offsets (the P28-4 ALIGNMENT
+// LAW -- dst+16/48/80/112 -- scalar byte stores have no such limit,
+// which is why the original loop was safe).
 static void __attribute__((noinline)) fused_sw_x(const float *__restrict temp,
                                                  uint8_t *__restrict dst)
 {
-    const uint32_t *__restrict tb =
-        reinterpret_cast<const uint32_t *__restrict>(temp);
-#pragma clang loop unroll(disable)
-    for (uint32_t j = 0; j < 16; j++) {
-        int32_t q0 = (int32_t)tb[j] - 0x4B400000;
-        int32_t q1 = (int32_t)tb[j + 16] - 0x4B400000;
-        if (q0 > 127) q0 = 127;
-        if (q0 < -127) q0 = -127;
-        if (q1 > 127) q1 = 127;
-        if (q1 < -127) q1 = -127;
-        const uint8_t r0 = (uint8_t)q0;
-        const uint8_t r1 = (uint8_t)q1;
-        for (uint32_t k = 0; k < 4; k++) {
-            dst[j + 16 * k] = r0;
-            dst[64 + j + 16 * k] = r1;
-        }
-    }
+    const aie::vector<int32_t, 32> t = aie::load_v<32>(
+        reinterpret_cast<const int32_t *__restrict>(temp));
+    const aie::vector<int32_t, 32> qs =
+        aie::sub(t, aie::broadcast<int32_t, 32>((int32_t)0x4B400000));
+    const aie::vector<int32_t, 32> qc = aie::min(
+        aie::max(qs, aie::broadcast<int32_t, 32>(-127)),
+        aie::broadcast<int32_t, 32>(127));
+    // lv_qscratch is dead here (fused_sw_quant consumed it before x in
+    // the same group chain) -- reuse it as the 32B staging buffer.
+    uint8_t *scr = lv_qscratch;
+    aie::store_v(reinterpret_cast<int8_t *__restrict>(scr),
+                 qc.pack<int16_t>().pack<int8_t>());
+    // lv_build_arena's body, g=0, dst-parameterized (all 32B-aligned):
+    // [q0 q0 | q0 q0] then [q1 q1 | q1 q1].
+    const int8_t *x8 = reinterpret_cast<const int8_t *__restrict>(scr);
+    int8_t *d = reinterpret_cast<int8_t *__restrict>(dst);
+    const aie::vector<int8, 16> q0 = aie::load_v<16>(x8);
+    const aie::vector<int8, 16> q1 = aie::load_v<16>(x8 + 16);
+    const aie::vector<int8, 32> r0 = aie::concat(q0, q0);
+    const aie::vector<int8, 32> r0b = aie::concat(q0, q0);
+    const aie::vector<int8, 32> r1 = aie::concat(q1, q1);
+    const aie::vector<int8, 32> r1b = aie::concat(q1, q1);
+    aie::store_v(d, r0);
+    aie::store_v(d + 32, r0b);
+    aie::store_v(d + 64, r1);
+    aie::store_v(d + 96, r1b);
 }
 
 // LINEAR 32B q extraction (ring2's global-j layout — no replication;
 // down's K=105 rebuild does the replication later).
+// P28-7 bisect round 5: vector WITHOUT the concat replication — if this
+// passes, the round-4 corruption lived in fused_sw_x's replication; if
+// it fails, the double-pack narrowing itself is guilty.
 static void __attribute__((noinline)) lv_sw_x32(const float *__restrict temp,
                                                 uint8_t *__restrict dst)
 {
-    const uint32_t *__restrict tb =
-        reinterpret_cast<const uint32_t *__restrict>(temp);
-#pragma clang loop unroll(disable)
-    for (uint32_t j = 0; j < 16; j++) {
-        int32_t q0 = (int32_t)tb[j] - 0x4B400000;
-        int32_t q1 = (int32_t)tb[j + 16] - 0x4B400000;
-        if (q0 > 127) q0 = 127;
-        if (q0 < -127) q0 = -127;
-        if (q1 > 127) q1 = 127;
-        if (q1 < -127) q1 = -127;
-        dst[j] = (uint8_t)q0;
-        dst[16 + j] = (uint8_t)q1;
-    }
+    const aie::vector<int32_t, 32> t = aie::load_v<32>(
+        reinterpret_cast<const int32_t *__restrict>(temp));
+    const aie::vector<int32_t, 32> qs =
+        aie::sub(t, aie::broadcast<int32_t, 32>((int32_t)0x4B400000));
+    const aie::vector<int32_t, 32> qc = aie::min(
+        aie::max(qs, aie::broadcast<int32_t, 32>(-127)),
+        aie::broadcast<int32_t, 32>(127));
+    const aie::vector<int8_t, 32> q = qc.pack<int16_t>().pack<int8_t>();
+    aie::store_v(reinterpret_cast<int8_t *__restrict>(dst), q);
 }
 
 // K=104 up block: window half fill; every completed 32-value pair runs
@@ -673,6 +704,18 @@ static void __attribute__((noinline)) lv_upelem(const uint8_t *__restrict a_in)
 static void lv_body(const uint8_t *__restrict a_in, bfloat16 *c_out)
 {
     const uint32_t k = *(const uint32_t *__restrict)(a_in + kBlockBytes - 8);
+    if (k == 2049) {
+        // P28-7 PERF-ONLY floor discriminator: the pack rewrites every W
+        // element's K header to 2049 (tools/lv2_floor_pack.py), the full
+        // lv_compute runs into the dead lv_dummy alias with zero glue and
+        // zero state -- T(full) - T(floor) IS the glue exposure the 6f-9
+        // duty-cycle model predicted (never directly measured before).
+        lv_compute(a_in,
+                   reinterpret_cast<const int8_t *__restrict>(lv_arena),
+                   reinterpret_cast<const bfloat16 *__restrict>(lv_dA),
+                   reinterpret_cast<bfloat16 *__restrict>(lv_dummy));
+        return;
+    }
     if (k == kTileK) {
         lv_k2048(a_in, c_out);
         return;
