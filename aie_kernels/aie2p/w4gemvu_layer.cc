@@ -123,7 +123,7 @@ static uint8_t lv_shared[kM1 * 2] __attribute__((aligned(64)));      // 4096: N 
 static uint8_t lv_dA[kGroups * 2] __attribute__((aligned(64)));      // 128: 64 bf16
 static uint8_t lv_temp[128] __attribute__((aligned(64)));            // per-group f32 staging
 static uint8_t lv_qscratch[128] __attribute__((aligned(64)));        // quant div lanes (PMEM law)
-static uint32_t lv_ctr[20] __attribute__((aligned(64)));
+static uint8_t lv_ctr[24] __attribute__((aligned(64)));
 
 // Phase-overlaid windows INSIDE lv_shared (L1 law). After K=101's rms
 // consumes the gathered x', all 4096 B are dead until ring3 rewrites
@@ -139,6 +139,21 @@ static uint32_t lv_ctr[20] __attribute__((aligned(64)));
 #define lv_gate (lv_shared)
 #define lv_upwin (lv_shared + 1536)
 #define lv_dummy (lv_shared + 1600)
+
+// P28-12 attention-phase overlays (zero net .bss — everything lives in
+// storage that is dead during attention): worker state (q/acc/m,l/kv)
+// overlays lv_sw (the sw int8 arena, written only in the gate/up phase
+// AFTER attention); cos/sin + q/k-norm weights overlay lv_shared (x'
+// gather image, dead between the qkv gather and ring3); the finalized
+// 256-row output overlays the SAME lv_shared region (cos/sin and the
+// norm weights are consumed at init, before any output is produced).
+#define lv_attn_q (lv_sw)                // 2 heads x 128 bf16 (512B)
+#define lv_attn_acc (lv_sw + 512)        // 2 heads x 128 f32 (1024B)
+#define lv_attn_ml (lv_sw + 1536)        // m0,m1,l0,l1 f32 (16B)
+#define lv_attn_kv (lv_sw + 1560)        // staged k_cur,v_cur bf16 x128
+#define lv_attn_cs (lv_shared)           // cos 128 f32 | sin 128 f32
+#define lv_attn_nw (lv_shared + 1024)    // qn 128 bf16 | kn 128 bf16
+#define lv_attn_out (lv_shared)          // 256 bf16, written at finalize
 
 // lv_ctr words
 constexpr uint32_t cO = 0;      // o block index (0..15)
@@ -162,6 +177,11 @@ constexpr uint32_t cMask = 16;  // N-1 (ring slot mask; N power of 2)
 constexpr uint32_t cJpw = 17;   // 6144/N int8 q bytes per ring2 slot
 constexpr uint32_t cDMask = 18; // (rows/16)-1: down row-block-in-chunk mask
 constexpr uint32_t cR2E = 19;   // ring2 element bytes = jpw + align32(grp*2)
+// P28-12 device-side attention state (standalone vehicle for layer-v3):
+constexpr uint32_t cAttnS = 20; // total attended positions incl current
+constexpr uint32_t cAttnJ = 21; // kvhist elements consumed
+constexpr uint32_t cAttnO = 22; // output 16-row pieces emitted (0..15)
+static volatile uint32_t khist_probe_nop; // bisect: 1 = skip attn_step
 
 // shared per-group helpers (P19 forms, cloned from w4gemvu.cc verbatim)
 static uint32_t __attribute__((noinline)) fused_sw_amax(const float *__restrict temp);
@@ -700,6 +720,327 @@ static void __attribute__((noinline)) lv_upelem(const uint8_t *__restrict a_in)
     }
 }
 
+// ---- P28-12 device-side attention flavors ----
+// Standalone verification vehicle for layer-v3 (all inference on NPU):
+// worker p (ring position) computes Q heads 2p, 2p+1 against KV head
+// p/2 (GQA 16Q/4KV), streaming the KV history one position per element
+// with an ONLINE softmax (no K-history storage — L1 cannot hold it).
+// Numerics mirror the golden chain (rope_pairs / qk_rms_bits /
+// attention_bits: f32 scores, softmax, PV; bf16 boundaries) with the
+// online-rescale and vector-rounding drift absorbed by the test
+// tolerance (4e-2 rel — the same band the mha kernel passes with).
+//
+// Element ABI (offsets in the 18560B element):
+//   K=210 init: [0,4096) q_full 2048 bf16 | [4096,5120) k_cur 512 bf16
+//               | [5120,6144) v_cur 512 bf16 | [6144,7168) cos 128 f32
+//               | [7168,8192) sin 128 f32 | [8192,8448) qn 128 bf16
+//               | [8448,8704) kn 128 bf16 | [8704,8708) S u32
+//   K=211 hist: [0,2048) k 4x128 bf16 | [2048,4096) v 4x128 bf16
+//   K=212 out:  first call finalizes (consumes the staged current k/v,
+//               normalizes, bf16-converts); every call copies the next
+//               16 output rows into the C element.
+
+// rotate-half rope on one 128-dim head: pairs (i, i+64) share
+// (cos[i], sin[i]); f32 math, bf16 out (golden rope_pairs form).
+// out_lo = lo*c - hi*s (sub: fused_rsqrt-proven); out_hi = hi*c + lo*s
+// via mul->acc then mac(acc, ones, prod) — the lv_fr1-proven add.
+static void __attribute__((noinline)) attn_rope(const bfloat16 *__restrict x,
+                                                bfloat16 *__restrict dst)
+{
+    const float *__restrict cs = reinterpret_cast<const float *__restrict>(lv_attn_cs);
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 64; i += 32) {
+        const aie::vector<float, 32> lo =
+            aie::mul(aie::load_v<32>(x + i), ones_bf).to_vector<float>();
+        const aie::vector<float, 32> hi =
+            aie::mul(aie::load_v<32>(x + 64 + i), ones_bf).to_vector<float>();
+        const aie::vector<float, 32> c = aie::load_v<32>(cs + i);
+        const aie::vector<float, 32> s = aie::load_v<32>(cs + 128 + i);
+        const aie::vector<float, 32> v_lo =
+            aie::sub(aie::mul(lo, c).to_vector<float>(),
+                     aie::mul(hi, s).to_vector<float>());
+        aie::accum<accfloat, 32> a_hi = aie::mul(hi, c);
+        a_hi = aie::mac(a_hi, ones_f, aie::mul(lo, s).to_vector<float>());
+        aie::store_v(dst + i, aie::mul(v_lo, ones_f).to_vector<bfloat16>());
+        aie::store_v(dst + 64 + i, a_hi.to_vector<bfloat16>());
+    }
+}
+
+// per-head rms over 128 AFTER rope, x*inv*w, bf16 out (qk_rms_bits
+// golden: SEQUENTIAL scalar sumsq — mirrored; rsqrt via the vector
+// Newton form; the /128 rides the vector mul like K=101's /2048).
+static void __attribute__((noinline)) attn_qknorm(const bfloat16 *__restrict x,
+                                                  const bfloat16 *__restrict w,
+                                                  bfloat16 *__restrict dst)
+{
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    float *__restrict temp = reinterpret_cast<float *__restrict>(lv_temp);
+    aie::accum<accfloat, 32> sq = aie::zeros<accfloat, 32>();
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 32) {
+        const aie::vector<float, 32> hf =
+            aie::mul(aie::load_v<32>(x + i), ones_bf).to_vector<float>();
+        sq = aie::mac(sq, hf, hf);
+    }
+    aie::store_v(temp, sq.to_vector<float>());
+    float ms = 0.0f;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 32; i++)
+        ms += temp[i];
+    aie::store_v(temp, aie::mul(aie::broadcast<float, 32>(ms),
+                                aie::broadcast<float, 32>(0x1p-7f)).to_vector<float>());
+    const float inv = fused_rsqrt(temp[0] + 1e-5f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 32) {
+        const aie::vector<float, 32> hf =
+            aie::mul(aie::load_v<32>(x + i), ones_bf).to_vector<float>();
+        const aie::vector<float, 32> wf =
+            aie::mul(aie::load_v<32>(w + i), ones_bf).to_vector<float>();
+        const aie::vector<float, 32> t =
+            aie::mul(hf, aie::broadcast<float, 32>(inv)).to_vector<float>();
+        aie::accum<accfloat, 32> o = aie::mac(z, t, wf);
+        aie::store_v(dst + i, o.to_vector<bfloat16>());
+    }
+}
+
+// e^x via the vector unit (peano has no scalar FPU): broadcast, scale
+// by log2e ON VECTORS, exp2 (bf16 result — the mha.cc-proven precision
+// class), widen, read lane 0.
+static __attribute__((noinline)) float attn_exp(float x)
+{
+    // fused_sw_sig's EXACT forms (mac-built argument, exp2, bf16->f32
+    // widen, store then memory readback) — only the log2e sign differs
+    // (we want e^x, sigmoid wants e^-x).
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+    const aie::accum<accfloat, 32> z = aie::zeros<accfloat, 32>();
+    const aie::vector<float, 32> posL =
+        aie::broadcast<float, 32>(1.4426950408889634f);
+    const aie::vector<float, 32> xv = aie::broadcast<float, 32>(x);
+    const aie::vector<float, 32> xarg = aie::mac(z, xv, posL).to_vector<float>();
+    const aie::vector<bfloat16, 32> t = aie::exp2(xarg);
+    const aie::vector<float, 32> tf = aie::mul(t, ones_bf).to_vector<float>();
+    (void)ones_f;
+    aie::store_v(reinterpret_cast<float *__restrict>(lv_temp), tf);
+    return reinterpret_cast<const float *__restrict>(lv_temp)[0];
+}
+
+// online-softmax update for both heads against one KV position:
+// s = dot(q_h, k)/sqrt(128) (f32; the /sqrt rides aie::div like the
+// quant path); m/l/acc rescale in f32 with mul->acc + mac(acc, e, v).
+// STACK LAW (P16/P17): peano gives each core a 0x400 stack window with
+// the A-fifo buffers directly above it — attn_step with everything
+// inlined hit 0x580 and overwrote the fifo stream (first-exec hang,
+// the P17 M6 signature). Keep the flavor frames small by splitting the
+// per-head compute into noinline helpers.
+static float __attribute__((noinline)) attn_dot(const bfloat16 *__restrict qh,
+                                                const bfloat16 *__restrict k_j)
+{
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    float *__restrict temp = reinterpret_cast<float *__restrict>(lv_temp);
+    aie::accum<accfloat, 32> acc = aie::zeros<accfloat, 32>();
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 32) {
+        const aie::vector<float, 32> qf =
+            aie::mul(aie::load_v<32>(qh + i), ones_bf).to_vector<float>();
+        const aie::vector<float, 32> kf =
+            aie::mul(aie::load_v<32>(k_j + i), ones_bf).to_vector<float>();
+        acc = aie::mac(acc, qf, kf);
+    }
+    aie::store_v(temp, acc.to_vector<float>());
+    float dot = 0.0f;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 32; i++)
+        dot += temp[i];
+    const aie::vector<float, 32> d_v = aie::broadcast<float, 32>(dot);
+    const aie::vector<float, 32> r_v = aie::broadcast<float, 32>(11.3137085f);
+    aie::store_v(temp, aie::div(d_v, r_v).to_vector<float>());
+    return temp[0]; // q.k / sqrt(128)
+}
+
+static void __attribute__((noinline)) attn_acc_update(float *__restrict ah,
+                                                      const bfloat16 *__restrict v_j,
+                                                      float alpha, float e)
+{
+    const aie::vector<bfloat16, 32> ones_bf =
+        aie::broadcast<bfloat16, 32>((bfloat16)1.0f);
+    const aie::vector<float, 32> alpha_v = aie::broadcast<float, 32>(alpha);
+    const aie::vector<float, 32> e_v = aie::broadcast<float, 32>(e);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 32) {
+        const aie::vector<float, 32> af = aie::load_v<32>(ah + i);
+        const aie::vector<float, 32> vf =
+            aie::mul(aie::load_v<32>(v_j + i), ones_bf).to_vector<float>();
+        aie::accum<accfloat, 32> r = aie::mul(af, alpha_v);
+        r = aie::mac(r, e_v, vf);
+        aie::store_v(ah + i, r.to_vector<float>());
+    }
+}
+
+static void __attribute__((noinline)) attn_step(const bfloat16 *__restrict k_j,
+                                                const bfloat16 *__restrict v_j)
+{
+    float *__restrict temp = reinterpret_cast<float *__restrict>(lv_temp);
+    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+#pragma clang loop unroll(disable)
+    for (uint32_t h = 0; h < 2; h++) {
+        const bfloat16 *__restrict qh =
+            reinterpret_cast<const bfloat16 *__restrict>(lv_attn_q) + h * 128;
+        const float s = attn_dot(qh, k_j);
+        if (s != s) return; // BISECT: stop after dot+div
+        const float m_old = ml[h];
+        const float m_new = s > m_old ? s : m_old;
+        // EXP2 DOMAIN LAW: aie::exp2 traps/stalls on huge-negative args
+        // (the shipped call sites only ever see |x| < ~100 sigmoid
+        // arguments; the online-softmax's first step feeds -1e30).
+        // Clamp to -80: exp(-80) ~ 1.8e-35 is numerically the zero the
+        // math wants anyway.
+        float ea = m_old - m_new;
+        if (ea < -40.0f)
+            ea = -40.0f;
+        float earg = s - m_new;
+        if (earg < -40.0f)
+            earg = -40.0f;
+        const float alpha = attn_exp(ea);
+        const float e = attn_exp(earg);
+        ml[h] = m_new;
+        // l_new = l*alpha + e on the vector unit (P17: NO scalar f32 mul
+        // — it would relink __mulsf3 into the 16KB PMEM).
+        const aie::vector<float, 32> l_old = aie::broadcast<float, 32>(ml[2 + h]);
+        const aie::vector<float, 32> al_v = aie::broadcast<float, 32>(alpha);
+        const aie::vector<float, 32> ones_f = aie::broadcast<float, 32>(1.0f);
+        const aie::vector<float, 32> e_v2 = aie::broadcast<float, 32>(e);
+        aie::store_v(temp,
+                     aie::mac(aie::mul(l_old, al_v), ones_f, e_v2).to_vector<float>());
+        ml[2 + h] = temp[0];
+        attn_acc_update(
+            reinterpret_cast<float *__restrict>(lv_attn_acc) + h * 128,
+            v_j, alpha, e);
+    }
+}
+
+// K=210: stage cos/sin + norm weights, rope+qk-norm q (heads 2p, 2p+1)
+// and k_cur (head p/2), zero the online state.
+static void __attribute__((noinline)) lv_attninit(const uint8_t *__restrict a_in)
+{
+    // CR-STATE LAW (P28-12): every shipped aie::exp2 call site runs
+    // AFTER some flavor set conv_even (lv_compute's residue) — exp2
+    // traps/stalls under the default CR state. The attention path
+    // touches no set_rounding flavor before its first exp2, so set it
+    // here, once.
+    ::aie::set_rounding(aie::rounding_mode::conv_even);
+    const uint32_t p = lv_ctr[cP];
+    lv_ctr[cAttnS] = *(const uint32_t *__restrict)(a_in + 8704);
+    lv_ctr[cAttnJ] = 0;
+    lv_ctr[cAttnO] = 0;
+    const uint32_t *__restrict cs32 =
+        reinterpret_cast<const uint32_t *__restrict>(a_in + 6144);
+    uint32_t *__restrict cd32 =
+        reinterpret_cast<uint32_t *__restrict>(lv_attn_cs);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 256; i++)
+        cd32[i] = cs32[i]; // cos 128 f32 | sin 128 f32
+    const bfloat16 *__restrict src =
+        reinterpret_cast<const bfloat16 *__restrict>(a_in);
+    bfloat16 *__restrict nw =
+        reinterpret_cast<bfloat16 *__restrict>(lv_attn_nw);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 16) {
+        aie::store_v(nw + i, aie::load_v<16>(src + 8192 / 2 + i));       // qn
+        aie::store_v(nw + 128 + i, aie::load_v<16>(src + 8448 / 2 + i)); // kn
+    }
+    bfloat16 *__restrict qd =
+        reinterpret_cast<bfloat16 *__restrict>(lv_attn_q);
+    bfloat16 *__restrict kvs =
+        reinterpret_cast<bfloat16 *__restrict>(lv_attn_kv);
+    const uint32_t h0 = 2 * p;
+    attn_rope(src + h0 * 128, qd);
+    attn_rope(src + (h0 + 1) * 128, qd + 128);
+    attn_qknorm(qd, nw, qd);
+    attn_qknorm(qd + 128, nw, qd + 128);
+    const uint32_t kvh = p / 2;
+    attn_rope(src + 2048 + kvh * 128, kvs);
+    attn_qknorm(kvs, nw + 128, kvs);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 128; i += 16)
+        aie::store_v(kvs + 128 + i,
+                     aie::load_v<16>(src + 2560 + kvh * 128 + i)); // v_cur
+    float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+    float *__restrict accp = reinterpret_cast<float *__restrict>(lv_attn_acc);
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 4; i++)
+        ml[i] = -1e30f;
+#pragma clang loop unroll(disable)
+    for (uint32_t i = 0; i < 256; i++)
+        accp[i] = 0.0f;
+}
+
+// K=211: one history position — worker p/2's KV slices.
+static void __attribute__((noinline)) lv_attnhist(const uint8_t *__restrict a_in)
+{
+    const uint32_t p = lv_ctr[cP];
+    const uint32_t kvh = p / 2;
+    const bfloat16 *__restrict b =
+        reinterpret_cast<const bfloat16 *__restrict>(a_in);
+    attn_step(b + kvh * 128, b + 1024 + kvh * 128);
+    lv_ctr[cAttnJ]++;
+}
+
+// K=212: first call processes the staged current k/v and finalizes
+// (out = acc/l, bf16); every call drains 16 output rows to the C
+// element.
+static void __attribute__((noinline)) lv_attnout(bfloat16 *__restrict c_out)
+{
+    const bfloat16 *__restrict kvs =
+        reinterpret_cast<const bfloat16 *__restrict>(lv_attn_kv);
+    if (lv_ctr[cAttnO] == 0) {
+        attn_step(kvs, kvs + 128); // current position = last entry
+        float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_ml);
+            aie::store_v(reinterpret_cast<float *__restrict>(lv_temp),
+                     aie::div(aie::broadcast<float, 32>(1.0f),
+                              aie::broadcast<float, 32>(ml[2]))
+                         .to_vector<float>()); // 1/l for head 0
+        const float inv0 = reinterpret_cast<const float *__restrict>(lv_temp)[0];
+        aie::store_v(reinterpret_cast<float *__restrict>(lv_temp),
+                     aie::div(aie::broadcast<float, 32>(1.0f),
+                              aie::broadcast<float, 32>(ml[3]))
+                         .to_vector<float>()); // 1/l for head 1
+        const float inv1 = reinterpret_cast<const float *__restrict>(lv_temp)[0];
+        bfloat16 *__restrict out =
+            reinterpret_cast<bfloat16 *__restrict>(lv_attn_out);
+        const float *__restrict accp =
+            reinterpret_cast<const float *__restrict>(lv_attn_acc);
+#pragma clang loop unroll(disable)
+        for (uint32_t h = 0; h < 2; h++) {
+            const float inv = h == 0 ? inv0 : inv1;
+            const aie::vector<float, 32> inv_v = aie::broadcast<float, 32>(inv);
+#pragma clang loop unroll(disable)
+            for (uint32_t i = 0; i < 128; i += 32) {
+                const aie::vector<float, 32> af =
+                    aie::load_v<32>(accp + h * 128 + i);
+                aie::store_v(out + h * 128 + i,
+                             aie::mul(af, inv_v).to_vector<bfloat16>());
+            }
+        }
+    }
+    const uint32_t o = lv_ctr[cAttnO]++;
+    // DEBUG MODE (S word bit 31): the 16 C elements stream the POST-
+    // rope/qknorm q rows (256 bf16) instead of the attention output —
+    // segment-by-segment bring-up.
+    const bfloat16 *__restrict out =
+        (lv_ctr[cAttnS] & 0x80000000u)
+            ? reinterpret_cast<const bfloat16 *__restrict>(lv_attn_q)
+            : reinterpret_cast<const bfloat16 *__restrict>(lv_attn_out);
+    aie::store_v(c_out, aie::load_v<16>(out + o * 16));
+}
+
 // ---- dispatcher (P16 stack law: tiny, tail-calls noinline flavors) ----
 static void lv_body(const uint8_t *__restrict a_in, bfloat16 *c_out)
 {
@@ -748,6 +1089,18 @@ static void lv_body(const uint8_t *__restrict a_in, bfloat16 *c_out)
         lv_downelem(a_in);
         return;
     }
+    if (k == 210) {
+        lv_attninit(a_in);
+        return;
+    }
+    if (k == 211) {
+        lv_attnhist(a_in);
+        return;
+    }
+    if (k == 212) {
+        lv_attnout(c_out);
+        return;
+    }
     // unknown K: no-op (the fill never produces one)
 }
 
@@ -770,6 +1123,38 @@ void w4gemvu_layer_bf16(const uint8_t *__restrict a_in,
 void w4gemvu_layer_a(const uint8_t *__restrict a_in)
 {
     lv_body(a_in, reinterpret_cast<bfloat16 *__restrict>(lv_dummy));
+}
+
+// P28-12 standalone attention entries: micro-dispatchers (PMEM
+// isolation — the lv_body chain would link ~20KB of flavors into a
+// 16KB program memory). Handles the X init (K=0, worker id/state) and
+// the three attention flavors; anything else is a no-op.
+void w4gemvu_attn_a(const uint8_t *__restrict a_in)
+{
+    const uint32_t k = *(const uint32_t *__restrict)(a_in + kBlockBytes - 8);
+    if (k == 0) {
+        lv_xelem(a_in);
+        return;
+    }
+    if (k == 210) {
+        lv_attninit(a_in);
+        return;
+    }
+    if (k == 211) {
+        lv_attnhist(a_in);
+        return;
+    }
+}
+
+void w4gemvu_attn_bf16(const uint8_t *__restrict a_in,
+                       bfloat16 *__restrict c_out)
+{
+    const uint32_t k = *(const uint32_t *__restrict)(a_in + kBlockBytes - 8);
+    if (k == 212) {
+        lv_attnout(c_out);
+        return;
+    }
+    w4gemvu_attn_a(a_in);
 }
 
 // ---- ring helpers (fifo acquire/release live in the design's worker
