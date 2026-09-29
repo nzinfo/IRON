@@ -288,10 +288,10 @@ def test_lv2attn(S, aie_context):
         f"INSTR w0: l(h0)={_bf(raw[240]):.4f} J={_bf(raw[241]):.1f} "
         f"q0..3={_bf(raw[0]):.4f},{_bf(raw[1]):.4f},{_bf(raw[2]):.4f},{_bf(raw[3]):.4f}"
     )
-    print(
-        f"CSTAB cos0={_bf(raw[248]):.4f} cos32={_bf(raw[249]):.4f} "
-        f"sin0={_bf(raw[250]):.4f} q0={_bf(raw[252]):.4f}"
-    )
+    print("TRACE step  s      m      alpha  e      l")
+    for k in range(0, 250, 5):
+        vals = [round(_bf(raw[k + t]), 3) for t in range(5)]
+        print(f"  {k//5:3d}  " + " ".join(f"{v:7.3f}" for v in vals))
     print("TRAJ l:", [round(_bf(raw[128 + k]), 3) for k in range(0, 48, 4)])
     print("TRAJ m:", [round(_bf(raw[192 + k]), 3) for k in range(0, 48, 4)])
     assert bad <= int(n * 0.005), f"test failed with {bad}/{n}"

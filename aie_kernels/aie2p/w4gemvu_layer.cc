@@ -929,11 +929,17 @@ static void __attribute__((noinline)) attn_step(const bfloat16 *__restrict k_j,
             reinterpret_cast<float *__restrict>(lv_attn_acc) + h * 128,
             v_j, alpha, e);
         if (h == 0) {
-            // TRAJECTORY INSTR: head-1 rows carry per-step l/m snapshots
-            uint16_t *ob = reinterpret_cast<uint16_t *__restrict>(lv_attn_out);
+            // TRACE TABLE at lv_shared+512: survives finalize (out only
+            // rewrites [0,512)); the old in-place rows were overwritten
+            // by the h=1 output loop and every TRAJ read was garbage.
+            uint16_t *tb =
+                reinterpret_cast<uint16_t *__restrict>(lv_shared + 512);
             uint32_t j = lv_ctr[cAttnJ] & 63u;
-            ob[128 + j] = fused_f32_to_bf16(ml[2]);
-            ob[192 + j] = fused_f32_to_bf16(ml[0]);
+            tb[j * 8 + 0] = fused_f32_to_bf16(s);
+            tb[j * 8 + 1] = fused_f32_to_bf16(m_new);
+            tb[j * 8 + 2] = fused_f32_to_bf16(alpha);
+            tb[j * 8 + 3] = fused_f32_to_bf16(e);
+            tb[j * 8 + 4] = fused_f32_to_bf16(ml[2]);
         }
     }
 }
@@ -989,9 +995,14 @@ static void __attribute__((noinline)) lv_attninit(const uint8_t *__restrict a_in
                      aie::load_v<16>(src + 2560 + kvh * 128 + i)); // v_cur
     float *__restrict ml = reinterpret_cast<float *__restrict>(lv_attn_mls);
     float *__restrict accp = reinterpret_cast<float *__restrict>(lv_attn_acc);
-#pragma clang loop unroll(disable)
-    for (uint32_t i = 0; i < 4; i++)
-        ml[i] = -1e30f;
+    // m starts at -inf, l MUST start at 0 — initializing all four to
+    // -1e30 contaminated every l with (−1e30)×alpha and produced the
+    // −1e12-scale outputs (trace-table catch, step 0: s/m/alpha/e all
+    // correct, l = −5.19e12 ≈ (−1e30)·exp(−40)).
+    ml[0] = -1e30f;
+    ml[1] = -1e30f;
+    ml[2] = 0.0f;
+    ml[3] = 0.0f;
 #pragma clang loop unroll(disable)
     for (uint32_t i = 0; i < 256; i++)
         accp[i] = 0.0f;
@@ -1044,17 +1055,6 @@ static void __attribute__((noinline)) lv_attnout(bfloat16 *__restrict c_out)
                              aie::mul(af, inv_v).to_vector<bfloat16>());
             }
         }
-        // BISECT instrumentation: row 240 = l (head 0), row 241 = hist
-        // elements consumed — reads out via the C drain.
-        uint16_t *ob = reinterpret_cast<uint16_t *__restrict>(lv_attn_out);
-        ob[240] = fused_f32_to_bf16(ml[2]);
-        ob[241] = fused_f32_to_bf16((float)lv_ctr[cAttnJ]);
-        const float *csp = reinterpret_cast<const float *__restrict>(lv_attn_cs);
-        ob[248] = fused_f32_to_bf16(csp[0]);   // cos[0] (~-0.99)
-        ob[249] = fused_f32_to_bf16(csp[32]);  // cos[32]
-        ob[250] = fused_f32_to_bf16(csp[64]);  // sin[0] (~0.13)
-        ob[252] = reinterpret_cast<const uint16_t *__restrict>(lv_attn_q)[0];
-        ob[253] = reinterpret_cast<const uint16_t *__restrict>(lv_attn_q)[1];
     }
     const uint32_t o = lv_ctr[cAttnO]++;
     // DEBUG MODE (S word bit 31): the 16 C elements stream the POST-
@@ -1062,7 +1062,7 @@ static void __attribute__((noinline)) lv_attnout(bfloat16 *__restrict c_out)
     // segment-by-segment bring-up.
     const bfloat16 *__restrict out =
         lv_ctr[cAttnDbg]
-            ? reinterpret_cast<const bfloat16 *__restrict>(lv_attn_q)
+            ? reinterpret_cast<const bfloat16 *__restrict>(lv_shared + 512)
             : reinterpret_cast<const bfloat16 *__restrict>(lv_attn_out);
     aie::store_v(c_out, aie::load_v<16>(out + o * 16));
 }
